@@ -1,6 +1,6 @@
 {
   "name": "zx-agent",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "zx — ИИ-агент для кода: терминал и файлы, бесплатные модели + топовые Claude/GPT по ключу, сборка в один .exe",
   "main": "server.js",
   "bin": "server.js",
