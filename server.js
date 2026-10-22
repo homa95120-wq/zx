@@ -13,7 +13,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const CATALOG = require('./lib/providers');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -562,6 +562,625 @@ async function handleUploadChunk(req, res, query) {
   send(res, 200, { ok: true, written: up.written, done, path: up.fp });
 }
 
+/* ---------- видео: монтаж и анализ через ffmpeg / ffprobe ---------- */
+const FFMPEG_NOT_FOUND_ERR = 'ffmpeg не найден. Установите: winget install Gyan.FFmpeg (Windows) / brew install ffmpeg (macOS) / apt install ffmpeg (Linux), либо задайте путь в ZX_FFMPEG.';
+const MEDIA_RENDER_DEFAULT_TIMEOUT = 600;
+const MEDIA_RENDER_MAX_TIMEOUT = 1800;
+const MEDIA_SCENES_TIMEOUT_MS = Number(process.env.ZX_SCENES_TIMEOUT_MS) || 120 * 1000;
+
+let ffmpegCache = { key: null, bin: null, at: 0 };
+let ffprobeCache = { key: null, bin: null, at: 0 };
+
+function isFileSync(p) {
+  if (!p) return false;
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
+function findInPath(binName) {
+  const rawPath = process.env.PATH ?? process.env.Path ?? '';
+  if (!rawPath) return null;
+  const isWin = process.platform === 'win32';
+  const names = isWin && !/\.exe$/i.test(binName) ? [binName + '.exe', binName] : [binName];
+  for (const dir of rawPath.split(path.delimiter)) {
+    const clean = dir.trim().replace(/^"(.*)"$/, '$1');
+    if (!clean) continue;
+    for (const n of names) {
+      const full = path.join(clean, n);
+      if (isFileSync(full)) return full;
+    }
+  }
+  try {
+    const locator = isWin ? 'where.exe' : 'which';
+    const r = spawnSync(locator, [binName], { shell: false, windowsHide: true, timeout: 3000, encoding: 'utf8', env: process.env });
+    if (r.status === 0 && r.stdout) {
+      const first = r.stdout.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+      if (first && isFileSync(first)) return first;
+    }
+  } catch {}
+  return null;
+}
+
+function findFfmpeg() {
+  const envKey = `${process.env.ZX_FFMPEG || ''}|${process.env.FFMPEG_PATH || ''}|${process.env.PATH ?? process.env.Path ?? ''}`;
+  if (ffmpegCache.key === envKey && (ffmpegCache.bin ? isFileSync(ffmpegCache.bin) : (Date.now() - ffmpegCache.at < 5000))) {
+    return ffmpegCache.bin;
+  }
+  let found = null;
+  for (const raw of [process.env.ZX_FFMPEG, process.env.FFMPEG_PATH]) {
+    if (raw && raw.trim()) {
+      const resolved = path.resolve(raw.trim());
+      if (isFileSync(resolved)) { found = resolved; break; }
+    }
+  }
+  if (!found) found = findInPath('ffmpeg');
+  if (!found && process.platform === 'win32') {
+    const winPaths = [
+      'C:\\ffmpeg\\bin\\ffmpeg.exe',
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe') : '',
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'ffmpeg', 'bin', 'ffmpeg.exe'),
+      process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'ffmpeg', 'bin', 'ffmpeg.exe') : '',
+    ];
+    for (const wp of winPaths) {
+      if (wp && isFileSync(wp)) { found = wp; break; }
+    }
+  }
+  ffmpegCache = { key: envKey, bin: found, at: Date.now() };
+  return found;
+}
+
+function findFfprobe() {
+  const ff = findFfmpeg();
+  const envKey = `${ff || ''}|${process.env.ZX_FFPROBE || ''}|${process.env.FFPROBE_PATH || ''}`;
+  if (ffprobeCache.key === envKey && (ffprobeCache.bin ? isFileSync(ffprobeCache.bin) : (Date.now() - ffprobeCache.at < 5000))) {
+    return ffprobeCache.bin;
+  }
+  let found = null;
+  const isWin = process.platform === 'win32';
+  const probeName = isWin ? 'ffprobe.exe' : 'ffprobe';
+  const candidates = [];
+  if (process.env.ZX_FFPROBE && process.env.ZX_FFPROBE.trim()) candidates.push(path.resolve(process.env.ZX_FFPROBE.trim()));
+  if (process.env.FFPROBE_PATH && process.env.FFPROBE_PATH.trim()) candidates.push(path.resolve(process.env.FFPROBE_PATH.trim()));
+  if (ff) {
+    candidates.push(path.join(path.dirname(ff), probeName));
+    if (!isWin) candidates.push(path.join(path.dirname(ff), 'ffprobe.exe'));
+    try {
+      const real = fs.realpathSync(ff);
+      if (real !== ff) candidates.push(path.join(path.dirname(real), probeName));
+    } catch {}
+  }
+  for (const c of candidates) {
+    if (c && isFileSync(c)) { found = c; break; }
+  }
+  ffprobeCache = { key: envKey, bin: found, at: Date.now() };
+  return found;
+}
+
+function killChild(child) {
+  if (!child) return;
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' }).unref();
+    } else {
+      child.kill('SIGKILL');
+    }
+  } catch {}
+  try { child.kill(); } catch {}
+  try { child.stdout?.destroy(); child.stderr?.destroy(); } catch {}
+}
+
+function runMediaProcess(bin, argsArray, opts = {}) {
+  const cwd = opts.cwd || WORKSPACE;
+  const timeoutMs = opts.timeoutMs || 60000;
+  const signal = opts.signal;
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      return resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false, aborted: true, spawnError: null });
+    }
+    let child;
+    try {
+      child = spawn(bin, argsArray, {
+        cwd,
+        shell: false,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      return resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false, aborted: false, spawnError: e.message });
+    }
+
+    let stdout = '';
+    let errHead = '';
+    let errTail = '';
+    let errTotal = 0;
+    let done = false;
+    let timedOut = false;
+    let aborted = false;
+
+    const onAbort = () => {
+      if (done) return;
+      aborted = true;
+      killChild(child);
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      timedOut = true;
+      killChild(child);
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      const s = chunk.toString('utf8');
+      if (opts.onStdout) opts.onStdout(s);
+      else if (stdout.length < 512 * 1024) stdout += s;
+    });
+
+    child.stderr.on('data', (chunk) => {
+      const s = chunk.toString('utf8');
+      if (opts.onStderr) opts.onStderr(s);
+      errTotal += s.length;
+      if (errHead.length < 2048) {
+        const need = 2048 - errHead.length;
+        errHead += s.slice(0, need);
+        const rest = s.slice(need);
+        if (rest) errTail = (errTail + rest).slice(-32768);
+      } else {
+        errTail = (errTail + s).slice(-32768);
+      }
+    });
+
+    const finish = (code, spawnError = null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      const stderr = errTotal <= errHead.length + errTail.length
+        ? errHead + errTail
+        : errHead + `\n… [обрезано, всего ${errTotal} симв.] …\n` + errTail;
+      resolve({ exitCode: code, stdout, stderr, timedOut, aborted, spawnError });
+    };
+
+    child.on('error', (e) => finish(null, e.message));
+    child.on('close', (code) => finish(code));
+  });
+}
+
+function truncMediaLog(s) {
+  const str = String(s || '');
+  if (str.length <= MAX_OUT) return str;
+  const headLen = 2048;
+  const marker = `\n… [обрезано, всего ${str.length} симв.] …\n`;
+  const tailLen = Math.max(1024, MAX_OUT - headLen - marker.length);
+  return str.slice(0, headLen) + marker + str.slice(-tailLen);
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function parseHms(str) {
+  const m = String(str || '').trim().match(/^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$/);
+  if (!m) return null;
+  const sec = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  return Number.isFinite(sec) ? round2(sec) : null;
+}
+
+function parseBitrateVal(numStr, unitStr) {
+  const n = Number(numStr);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const u = String(unitStr || '').toLowerCase();
+  if (u.startsWith('mb') || u.startsWith('mbit')) return Math.round(n * 1e6);
+  if (u.startsWith('kb') || u.startsWith('kbit')) return Math.round(n * 1e3);
+  return Math.round(n);
+}
+
+function parseFpsRatio(r) {
+  if (!r || r === '0/0') return null;
+  const s = String(r);
+  if (s.includes('/')) {
+    const [a, b] = s.split('/').map(Number);
+    if (Number.isFinite(a) && Number.isFinite(b) && b > 0 && a > 0) return round2(a / b);
+    return null;
+  }
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? round2(n) : null;
+}
+
+function parseFfprobeJson(rawJson, file, sizeBytes) {
+  let j;
+  try { j = JSON.parse(rawJson); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const rawStreams = Array.isArray(j.streams) ? j.streams : [];
+  const format = j.format?.format_name ? String(j.format.format_name) : null;
+  if (!rawStreams.length || format === 'tty') return null;
+
+  const streams = rawStreams.map((s) => {
+    const type = String(s.codec_type || 'unknown').toLowerCase();
+    const isVideo = type === 'video';
+    const isAudio = type === 'audio';
+    const br = s.bit_rate != null && Number.isFinite(Number(s.bit_rate)) ? Math.round(Number(s.bit_rate)) : null;
+    return {
+      type,
+      codec: s.codec_name ? String(s.codec_name).toLowerCase() : null,
+      width: isVideo && s.width != null ? Number(s.width) : null,
+      height: isVideo && s.height != null ? Number(s.height) : null,
+      fps: isVideo ? (parseFpsRatio(s.avg_frame_rate) ?? parseFpsRatio(s.r_frame_rate)) : null,
+      bitrate: br,
+      sampleRate: isAudio && s.sample_rate != null ? Number(s.sample_rate) : null,
+      channels: isAudio && s.channels != null ? Number(s.channels) : null,
+    };
+  });
+
+  const durCand = j.format?.duration ?? rawStreams.map((s) => s.duration).find((d) => d != null);
+  const duration = durCand != null && Number.isFinite(Number(durCand)) ? round2(Number(durCand)) : null;
+  const hasVideo = streams.some((s) => s.type === 'video');
+  const hasAudio = streams.some((s) => s.type === 'audio');
+  return {
+    ok: true,
+    path: file,
+    duration,
+    sizeBytes: sizeBytes ?? (j.format?.size != null ? Number(j.format.size) : null),
+    format,
+    streams,
+    hasVideo,
+    hasAudio,
+  };
+}
+
+function parseFfmpegStderrProbe(stderr, file, sizeBytes) {
+  const text = String(stderr || '');
+  const fm = text.match(/Input #0,\s*([^\r\n]+?),\s*from\s+/i);
+  const format = fm ? fm[1].trim() : null;
+  const dm = text.match(/Duration:\s*(\d+:\d{2}:\d{2}(?:\.\d+)?)/i);
+  const duration = dm ? parseHms(dm[1]) : null;
+  const gbm = text.match(/Duration:[^\r\n]*?\bbitrate:\s*(\d+(?:\.\d+)?)\s*(kb\/s|mb\/s|kbits\/s|mbits\/s|b\/s)\b/i);
+  const globalBitrate = gbm ? parseBitrateVal(gbm[1], gbm[2]) : null;
+
+  const streams = [];
+  const streamRe = /Stream\s+#\d+:\d+(?:\[[^\]]*\])?(?:\([^)]*\))?:?\s*(Video|Audio|Subtitle):\s*([^\r\n]+)/gi;
+  let m;
+  while ((m = streamRe.exec(text)) !== null) {
+    const type = m[1].toLowerCase();
+    const info = m[2];
+    const cm = info.match(/^([a-zA-Z0-9_.-]+)/);
+    const codec = cm ? cm[1].toLowerCase() : null;
+    let width = null, height = null, fps = null, bitrate = null, sampleRate = null, channels = null;
+
+    const bm = info.match(/(\d+(?:\.\d+)?)\s*(kb\/s|mb\/s|kbits\/s|mbits\/s|b\/s)\b/i);
+    if (bm) bitrate = parseBitrateVal(bm[1], bm[2]);
+
+    if (type === 'video') {
+      const rm = info.match(/(?:^|[,\s])([1-9]\d{1,4})x([1-9]\d{1,4})(?=[\s,\[)]|$)/);
+      if (rm) { width = Number(rm[1]); height = Number(rm[2]); }
+      const fpsm = info.match(/(\d+(?:\.\d+)?)\s*fps\b/i) || info.match(/(\d+(?:\.\d+)?)\s*tbr\b/i);
+      if (fpsm) fps = round2(Number(fpsm[1]));
+      if (bitrate == null && globalBitrate != null && streams.length === 0) bitrate = globalBitrate;
+    } else if (type === 'audio') {
+      const srm = info.match(/(\d+)\s*Hz\b/i);
+      if (srm) sampleRate = Number(srm[1]);
+      for (const part of info.split(',').map((p) => p.trim())) {
+        if (/^mono\b/i.test(part)) { channels = 1; break; }
+        if (/^stereo\b/i.test(part)) { channels = 2; break; }
+        if (/^quad\b/i.test(part)) { channels = 4; break; }
+        const chm = part.match(/^(\d+)\s*channels?\b/i);
+        if (chm) { channels = Number(chm[1]); break; }
+        const layout = part.match(/^([1-9])\.([0-9])(?:\(|$)/);
+        if (layout) { channels = Number(layout[1]) + Number(layout[2]); break; }
+      }
+    }
+
+    streams.push({ type, codec, width, height, fps, bitrate, sampleRate, channels });
+  }
+
+  if (!streams.length || format === 'tty') {
+    return { ok: false, path: file, error: 'файл не распознан как видео или аудио' };
+  }
+  const hasVideo = streams.some((s) => s.type === 'video');
+  const hasAudio = streams.some((s) => s.type === 'audio');
+  return { ok: true, path: file, duration, sizeBytes, format, streams, hasVideo, hasAudio };
+}
+
+async function probeMetadataOnly(file, sizeBytes, ctx) {
+  const ffmpegBin = findFfmpeg();
+  const ffprobeBin = findFfprobe();
+  if (!ffmpegBin && !ffprobeBin) return { ok: false, error: FFMPEG_NOT_FOUND_ERR };
+
+  if (ffprobeBin) {
+    const pr = await runMediaProcess(
+      ffprobeBin,
+      ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file],
+      { timeoutMs: 30000, signal: ctx?.signal }
+    );
+    if (pr.aborted) return { ok: false, path: file, error: 'операция отменена' };
+    if (pr.exitCode === 0 && pr.stdout) {
+      const parsed = parseFfprobeJson(pr.stdout, file, sizeBytes);
+      if (parsed) return parsed;
+    }
+    if (!ffmpegBin) {
+      return { ok: false, path: file, error: 'не удалось прочитать метаданные медиафайла (файл повреждён или не является видео/аудио)' };
+    }
+  }
+
+  const fr = await runMediaProcess(ffmpegBin, ['-hide_banner', '-i', file], { timeoutMs: 30000, signal: ctx?.signal });
+  if (fr.aborted) return { ok: false, path: file, error: 'операция отменена' };
+  if (fr.spawnError) return { ok: false, path: file, error: 'ошибка запуска ffmpeg: ' + fr.spawnError };
+  if (fr.timedOut) return { ok: false, path: file, timedOut: true, error: 'таймаут чтения метаданных файла' };
+  return parseFfmpegStderrProbe(fr.stderr, file, sizeBytes);
+}
+
+async function mediaProbe(args, ctx = {}) {
+  const rawPath = String(args?.path || '').trim();
+  if (!rawPath) return { ok: false, error: 'укажите путь к медиафайлу (path)' };
+
+  const ffmpegBin = findFfmpeg();
+  if (!ffmpegBin) return { ok: false, error: FFMPEG_NOT_FOUND_ERR };
+
+  const file = safeJoin(WORKSPACE, rawPath);
+  let st;
+  try {
+    st = await fs.promises.stat(file);
+  } catch {
+    return { ok: false, path: file, error: 'файл не найден: ' + file };
+  }
+  if (st.isDirectory()) {
+    return { ok: false, path: file, error: 'указана папка, а не медиафайл: ' + file };
+  }
+
+  const meta = await probeMetadataOnly(file, st.size, ctx);
+  if (!meta.ok) return meta;
+
+  if (!args?.scenes) return meta;
+  if (!meta.hasVideo) return { ...meta, scenes: [] };
+
+  const rawThr = Number(args.threshold);
+  const threshold = Number.isFinite(rawThr) ? Math.min(1, Math.max(0, rawThr)) : 0.3;
+  const rawMax = Number(args.maxScenes);
+  const maxScenes = Number.isFinite(rawMax) && rawMax > 0 ? Math.min(500, Math.floor(rawMax)) : 40;
+
+  const scenes = [];
+  let carry = '';
+  let lastScore = null;
+  const parseSceneLine = (line) => {
+    const sm = line.match(/(?:scene_score|score)\s*[=:]\s*(\d+(?:\.\d+)?)/i);
+    if (sm) lastScore = round2(Number(sm[1]));
+    const tm = line.match(/pts_time:\s*(\d+(?:\.\d+)?)/);
+    if (tm && scenes.length < maxScenes) {
+      const isShowinfoOrPlain = line.includes('showinfo') || !line.includes('Parsed_metadata');
+      if (isShowinfoOrPlain) {
+        scenes.push({ time: round2(Number(tm[1])), score: lastScore != null ? lastScore : round2(threshold) });
+        lastScore = null;
+      }
+    }
+  };
+
+  const sr = await runMediaProcess(
+    ffmpegBin,
+    ['-hide_banner', '-i', file, '-vf', `select='gt(scene,${threshold})',showinfo`, '-an', '-f', 'null', '-'],
+    {
+      timeoutMs: MEDIA_SCENES_TIMEOUT_MS,
+      signal: ctx?.signal,
+      onStderr: (chunk) => {
+        carry += chunk;
+        let nl;
+        while ((nl = carry.indexOf('\n')) >= 0) {
+          const line = carry.slice(0, nl);
+          carry = carry.slice(nl + 1);
+          parseSceneLine(line);
+        }
+      },
+    }
+  );
+  if (carry) parseSceneLine(carry);
+
+  if (sr.aborted) {
+    return { ...meta, ok: false, error: 'поиск сцен отменён', scenes };
+  }
+  if (sr.timedOut) {
+    return {
+      ...meta,
+      ok: false,
+      timedOut: true,
+      error: `таймаут анализа сцен (${Math.round(MEDIA_SCENES_TIMEOUT_MS / 1000)} сек); возвращён частичный результат`,
+      scenes,
+    };
+  }
+  return { ...meta, scenes };
+}
+
+function extractFfmpegError(stderr, exitCode) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const tail = lines.slice(-4).join(' | ');
+  return tail
+    ? `ошибка ffmpeg (код ${exitCode}): ${tail.slice(0, 300)}`
+    : `ffmpeg завершился с ошибкой (код ${exitCode})`;
+}
+
+async function mediaRender(args, ctx = {}) {
+  if (!Array.isArray(args?.args) || args.args.length === 0) {
+    return { ok: false, error: 'параметр args обязателен и должен быть непустым массивом аргументов ffmpeg' };
+  }
+  for (const item of args.args) {
+    if (item === null || item === undefined || typeof item === 'object') {
+      return { ok: false, error: 'все элементы args должны быть строками' };
+    }
+  }
+
+  const ffmpegBin = findFfmpeg();
+  if (!ffmpegBin) return { ok: false, error: FFMPEG_NOT_FOUND_ERR };
+
+  let userArgs = args.args.map((x) => String(x));
+  if (userArgs.length > 1 && /^ffmpeg(\.exe)?$/i.test(userArgs[0]) && userArgs[1].startsWith('-')) {
+    userArgs = userArgs.slice(1);
+  }
+
+  const cwd = args.cwd ? safeJoin(WORKSPACE, args.cwd) : WORKSPACE;
+  try {
+    const st = await fs.promises.stat(cwd);
+    if (!st.isDirectory()) return { ok: false, error: 'cwd не является папкой: ' + cwd };
+  } catch {
+    return { ok: false, error: 'рабочая папка не найдена: ' + cwd };
+  }
+
+  const rawTimeout = Number(args.timeout);
+  const timeoutSec = Number.isFinite(rawTimeout) && rawTimeout > 0
+    ? Math.min(MEDIA_RENDER_MAX_TIMEOUT, rawTimeout)
+    : MEDIA_RENDER_DEFAULT_TIMEOUT;
+  const timeoutMs = Math.max(50, Math.round(timeoutSec * 1000));
+
+  const lastArg = userArgs[userArgs.length - 1];
+  const isSpecialOut = lastArg === '-' || /^[a-z]{2,}:/i.test(lastArg);
+  const outPath = isSpecialOut ? lastArg : safeJoin(cwd, lastArg);
+  if (!isSpecialOut) {
+    try { await fs.promises.mkdir(path.dirname(outPath), { recursive: true }); } catch {}
+  }
+
+  // Пробуем узнать длительность входного файла для расчёта percent
+  let inputDuration = null;
+  for (let i = 0; i < userArgs.length - 1; i++) {
+    if (userArgs[i] === '-i') {
+      const prevLavfi = i >= 2 && userArgs[i - 2] === '-f' && userArgs[i - 1] === 'lavfi';
+      if (prevLavfi) continue;
+      const inFile = safeJoin(cwd, userArgs[i + 1]);
+      if (isFileSync(inFile)) {
+        try {
+          const st = await fs.promises.stat(inFile);
+          const pr = await probeMetadataOnly(inFile, st.size, ctx);
+          if (pr.ok && pr.duration > 0) { inputDuration = pr.duration; break; }
+        } catch {}
+      }
+    }
+  }
+
+  const hasOverwrite = userArgs.includes('-y') || userArgs.includes('-n');
+  const prefix = ['-hide_banner', '-nostdin', '-progress', 'pipe:1', '-nostats'];
+  if (!hasOverwrite) prefix.push('-y');
+  const fullArgs = [...prefix, ...userArgs];
+
+  let seconds = 0;
+  let fps = null;
+  let speed = null;
+  let frame = null;
+  let ended = false;
+  let outCarry = '';
+
+  const parseProgressLine = (line) => {
+    const eq = line.indexOf('=');
+    if (eq <= 0) return;
+    const k = line.slice(0, eq).trim();
+    const v = line.slice(eq + 1).trim();
+    if (!v || v === 'N/A') return;
+    if (k === 'out_time_ms' || k === 'out_time_us') {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) seconds = round2(n / 1e6);
+    } else if (k === 'out_time') {
+      const hms = parseHms(v);
+      if (hms != null && hms >= 0) seconds = hms;
+    } else if (k === 'fps') {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) fps = round2(n);
+    } else if (k === 'frame') {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) frame = Math.floor(n);
+    } else if (k === 'speed') {
+      speed = v;
+    } else if (k === 'progress' && v === 'end') {
+      ended = true;
+    }
+  };
+
+  const t0 = Date.now();
+  const rr = await runMediaProcess(ffmpegBin, fullArgs, {
+    cwd,
+    timeoutMs,
+    signal: ctx?.signal,
+    onStdout: (chunk) => {
+      outCarry += chunk;
+      let nl;
+      while ((nl = outCarry.indexOf('\n')) >= 0) {
+        const line = outCarry.slice(0, nl);
+        outCarry = outCarry.slice(nl + 1);
+        parseProgressLine(line);
+      }
+    },
+  });
+  if (outCarry) parseProgressLine(outCarry);
+  const durationMs = Date.now() - t0;
+
+  const progress = {
+    seconds,
+    ...(inputDuration && inputDuration > 0
+      ? { percent: Math.min(100, Math.max(0, Math.round((seconds / inputDuration) * 1000) / 10)) }
+      : {}),
+    fps,
+    speed,
+    ...(frame != null ? { frame } : {}),
+    ...(ended ? { done: true } : {}),
+  };
+
+  const log = truncMediaLog(rr.stderr);
+
+  if (rr.aborted) {
+    return {
+      ok: false,
+      aborted: true,
+      exitCode: rr.exitCode,
+      outPath,
+      progress,
+      durationMs,
+      timedOut: false,
+      error: 'рендер отменён клиентом',
+      log,
+    };
+  }
+
+  if (rr.spawnError) {
+    return {
+      ok: false,
+      exitCode: rr.exitCode,
+      outPath,
+      progress,
+      durationMs,
+      timedOut: false,
+      error: 'не удалось запустить ffmpeg: ' + rr.spawnError,
+      log,
+    };
+  }
+
+  if (rr.timedOut) {
+    return {
+      ok: false,
+      exitCode: rr.exitCode,
+      outPath,
+      progress,
+      durationMs,
+      timedOut: true,
+      error: `превышен таймаут рендера (${timeoutSec} сек) — разбейте рендер на части (по -ss / -t) или ускорьте пресет кодирования`,
+      log,
+    };
+  }
+
+  const ok = rr.exitCode === 0;
+  let sizeBytes = null;
+  if (ok && !isSpecialOut) {
+    try { sizeBytes = (await fs.promises.stat(outPath)).size; } catch {}
+  }
+
+  return {
+    ok,
+    exitCode: rr.exitCode,
+    outPath,
+    ...(sizeBytes != null ? { sizeBytes } : {}),
+    progress,
+    durationMs,
+    timedOut: false,
+    ...(ok ? {} : { error: extractFfmpegError(rr.stderr, rr.exitCode) }),
+    log,
+  };
+}
+
 const TOOLS = {
   run_terminal: runTerminal,
   list_dir: listDir,
@@ -569,15 +1188,23 @@ const TOOLS = {
   write_file: writeFileTool,
   web_search: webSearch,
   web_fetch: webFetch,
+  media_probe: mediaProbe,
+  media_render: mediaRender,
 };
 
 async function handleToolExec(req, res) {
+  const ac = new AbortController();
+  const onAbort = () => { if (!res.writableEnded) ac.abort(); };
+  req.on('aborted', onAbort);
+  req.on('close', () => { if (!req.complete && !res.writableEnded) ac.abort(); });
+  res.on('close', onAbort);
+
   let parsed;
   try { parsed = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'bad json' }); }
   const fn = TOOLS[parsed?.tool];
   if (!fn) return send(res, 400, { error: 'неизвестный инструмент' });
-  const result = await fn(parsed.args || {});
-  send(res, 200, result);
+  const result = await fn(parsed.args || {}, { signal: ac.signal });
+  if (!res.writableEnded) send(res, 200, result);
 }
 
 function serveStatic(req, res, pathname) {

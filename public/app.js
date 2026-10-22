@@ -149,11 +149,49 @@ const TOOLS_SCHEMA = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'media_probe',
+      description: 'Посмотреть видео: длительность, кодеки, разрешение, сцены; всегда вызывай перед монтажом, чтобы знать исходники.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'путь к медиафайлу (относительный рабочей папки или абсолютный)' },
+          scenes: { type: 'boolean', description: 'искать смену сцен (по умолчанию false)' },
+          threshold: { type: 'number', description: 'порог смены сцены 0..1 (по умолчанию 0.3)' },
+          maxScenes: { type: 'number', description: 'максимальное число сцен (по умолчанию 40)' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'media_render',
+      description: 'Смонтировать видео через ffmpeg: обрезка, склейка, звук, субтитры, масштаб, перекодирование; args — массив аргументов ffmpeg, последний элемент — выходной файл.',
+      parameters: {
+        type: 'object',
+        properties: {
+          args: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'массив аргументов ffmpeg без имени бинарника, последний элемент — выходной файл',
+          },
+          cwd: { type: 'string', description: 'подпапка рабочей области (необязательно)' },
+          timeout: { type: 'number', description: 'таймаут рендера в секундах (по умолчанию 600, максимум 1800)' },
+        },
+        required: ['args'],
+      },
+    },
+  },
 ];
 
 const TOOL_LABELS = {
   run_terminal: 'Терминал', read_file: 'Читаю файл', write_file: 'Пишу файл', list_dir: 'Список файлов',
   web_search: 'Поиск в интернете', web_fetch: 'Читаю страницу',
+  media_probe: 'Смотрю видео', media_render: 'Монтирую видео',
 };
 
 function agentSystem() {
@@ -161,8 +199,9 @@ function agentSystem() {
   return [
     'Ты — zx, агент-помощник по программированию, работающий на машине пользователя.',
     `Рабочая папка: ${WS.workspace} (платформа: ${WS.platform}).`,
-    'Доступные инструменты: run_terminal (команды терминала), read_file, write_file, list_dir, web_search, web_fetch.',
+    'Доступные инструменты: run_terminal (команды терминала), read_file, write_file, list_dir, web_search, web_fetch, media_probe, media_render.',
     'Есть инструменты web_search и web_fetch: если данных не хватает или они могут устареть — сначала web_search, затем web_fetch 1–3 самых подходящих страниц, опирайся на источники и указывай их ссылки в ответе.',
+    'Для видео используй media_probe (сначала узнай длительность/кодеки/сцены), затем media_render с массивом аргументов ffmpeg; после рендера проверь результат через media_probe и покажи пользователю путь к файлу.',
     'Перед правками сначала смотри реальные файлы (read_file/list_dir), не выдумывай их содержимое.',
     'После изменений запускай проверки (тесты/сборку) через run_terminal и разбирай ошибки.',
     'Каждое действие пользователь подтверждает вручную. Отвечай кратко, по делу, на русском.',
@@ -274,6 +313,27 @@ function renderMarkdown(text, extraThink = '') {
 }
 
 /* ---------------- карточки действий агента ---------------- */
+function fmtDur(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 60) return (Math.round(n * 100) / 100) + ' с';
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = Math.round(n % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function baseName(p) {
+  return String(p || '').split(/[\\/]/).filter(Boolean).pop() || String(p || '');
+}
+
+function fmtFfmpegArg(a) {
+  const s = String(a ?? '');
+  return /[\s"'\\]/.test(s) ? `"${s.replace(/(["\\])/g, '\\$1')}"` : s;
+}
+
 function toolCardHtml(st) {
   const label = TOOL_LABELS[st.tool] || st.tool;
   let short = '', detail = '';
@@ -292,6 +352,63 @@ function toolCardHtml(st) {
   } else if (st.tool === 'web_fetch') {
     short = st.args.url || '';
     detail = String(st.result?.content || st.result?.error || '');
+  } else if (st.tool === 'media_probe') {
+    const r = st.result || {};
+    const name = baseName(r.path || st.args?.path);
+    if (r.ok) {
+      const streams = Array.isArray(r.streams) ? r.streams : [];
+      const v = streams.find((s) => s.type === 'video');
+      const codecs = [...new Set(streams.map((s) => s.codec).filter(Boolean))].join('/');
+      const res = v && v.width && v.height ? `${v.width}x${v.height}` : '';
+      const dur = fmtDur(r.duration);
+      const scCount = Array.isArray(r.scenes) ? `${r.scenes.length} сцен` : '';
+      short = [name, dur, res, codecs, scCount].filter(Boolean).join(' · ');
+      const lines = [];
+      lines.push(`Файл: ${r.path || st.args?.path || ''}`);
+      const metaParts = [
+        r.format ? `формат: ${r.format}` : '',
+        r.duration != null ? `длительность: ${r.duration} с` : '',
+        r.sizeBytes != null ? `размер: ${fmtSize(r.sizeBytes)}` : '',
+      ].filter(Boolean);
+      if (metaParts.length) lines.push(metaParts.join(' · '));
+      streams.forEach((s, i) => {
+        if (s.type === 'video') {
+          lines.push(`Поток #${i} [video]: ${[s.codec || '?', s.width && s.height ? `${s.width}x${s.height}` : '', s.fps ? `${s.fps} fps` : '', s.bitrate ? `${Math.round(s.bitrate / 1000)} кбит/с` : ''].filter(Boolean).join(', ')}`);
+        } else if (s.type === 'audio') {
+          lines.push(`Поток #${i} [audio]: ${[s.codec || '?', s.sampleRate ? `${s.sampleRate} Гц` : '', s.channels ? `${s.channels} кан.` : '', s.bitrate ? `${Math.round(s.bitrate / 1000)} кбит/с` : ''].filter(Boolean).join(', ')}`);
+        } else {
+          lines.push(`Поток #${i} [${s.type || '?'}]: ${s.codec || '?'}`);
+        }
+      });
+      if (Array.isArray(r.scenes)) {
+        lines.push(`Сцены (${r.scenes.length}): ` + (r.scenes.length
+          ? r.scenes.map((sc) => (sc.score != null ? `${sc.time}с (${sc.score})` : `${sc.time}с`)).join(', ')
+          : 'нет'));
+      }
+      detail = lines.join('\n');
+    } else {
+      short = name || st.args?.path || '';
+      const parts = [r.error || ''];
+      if (Array.isArray(r.scenes) && r.scenes.length) {
+        parts.push('Частично найдено сцен: ' + r.scenes.map((sc) => `${sc.time}с`).join(', '));
+      }
+      detail = parts.filter(Boolean).join('\n');
+    }
+  } else if (st.tool === 'media_render') {
+    const r = st.result || {};
+    const argList = Array.isArray(st.args?.args) ? st.args.args.map(String) : [];
+    const outFile = r.outPath || (argList.length ? argList[argList.length - 1] : '');
+    const durTxt = r.durationMs != null ? (r.durationMs / 1000).toFixed(1) + ' с' : '';
+    const speedTxt = r.progress?.speed || '';
+    const sizeTxt = r.sizeBytes != null ? fmtSize(r.sizeBytes) : '';
+    short = [baseName(outFile) || outFile, durTxt, speedTxt, sizeTxt].filter(Boolean).join(' · ');
+    const logLines = String(r.log || '').split(/\r?\n/);
+    const tail = logLines.slice(-40).join('\n').trim();
+    detail = [
+      outFile ? `Выход: ${outFile}` : '',
+      r.error ? `Ошибка: ${r.error}` : '',
+      tail,
+    ].filter(Boolean).join('\n');
   } else {
     short = st.args.path || '.';
     detail = st.tool === 'read_file' ? String(st.result?.content || '').split('\n').slice(0, 12).join('\n')
@@ -609,6 +726,15 @@ function approvalDetail(call) {
   }
   if (call.name === 'web_search') return `Поиск в интернете: ${call.args.query || ''}\n# ${call.args.limit || 6} результатов`;
   if (call.name === 'web_fetch') return `Открыть страницу:\n${call.args.url || ''}`;
+  if (call.name === 'media_probe') {
+    return `${call.args.path || ''}` + (call.args.scenes ? `\n# поиск сцен (порог ${call.args.threshold ?? 0.3})` : '');
+  }
+  if (call.name === 'media_render') {
+    const list = Array.isArray(call.args.args) ? call.args.args.map(String) : [];
+    const outFile = list.length ? list[list.length - 1] : '';
+    const cmd = 'ffmpeg ' + list.map(fmtFfmpegArg).join(' ');
+    return `${cmd}\n# выходной файл: ${outFile || '—'}` + (call.args.cwd ? `\n# в ${call.args.cwd}` : '');
+  }
   return call.args.path || '(рабочая папка)';
 }
 
@@ -640,9 +766,11 @@ async function execTool(call) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ tool: call.name, args: call.args }),
+      signal: streaming?.abort?.signal,
     });
     return { denied: false, result: await res.json() };
   } catch (e) {
+    if (e && (e.name === 'AbortError' || streaming?.stopped)) throw e;
     return { denied: false, result: { ok: false, error: 'не удалось выполнить: ' + e.message } };
   }
 }
@@ -1031,8 +1159,10 @@ async function runCompletion(c) {
             st.pending = false; st.denied = denied; st.result = result; st.ok = !!result.ok;
             rerender();
             // web_fetch отдаёт до 48К символов страницы — модели нужен весь кусок,
-            // чтобы работал offset-хинт в конце; остальные результаты короче.
-            const toolBudget = call.name === 'web_fetch' ? 50 * 1024 : 8000;
+            // чтобы работал offset-хинт в конце; media_probe/media_render — до 16 КБ.
+            const toolBudget = call.name === 'web_fetch'
+              ? 50 * 1024
+              : (call.name === 'media_probe' || call.name === 'media_render' ? 16 * 1024 : 8000);
             apiMessages.push({
               role: 'tool',
               tool_call_id: id,

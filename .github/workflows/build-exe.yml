@@ -26,6 +26,10 @@ jobs:
       - name: Install deps
         run: npm ci
 
+      - name: Install ffmpeg
+        continue-on-error: true
+        run: choco install ffmpeg -y --no-progress
+
       - name: Tests
         run: npm test
         shell: bash
@@ -45,8 +49,8 @@ jobs:
       - name: Publish to Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: zx-agent-v1.4.0
-          name: zx-agent v1.4.0 — Windows .exe
+          tag_name: zx-agent-v1.5.0
+          name: zx-agent v1.5.0 — Windows .exe
           files: release/zx-agent.exe
           body: |
             zx — ИИ-агент для кода в одном файле.
@@ -54,7 +58,8 @@ jobs:
             **Запуск:** скачайте `zx-agent.exe`, двойной клик — откроется браузер с приложением.
             Консольное окно закрывать не нужно (это сервер агента). Остановка: Ctrl+C в консоли или закрыть окно.
 
-            - Терминал и файлы: агент выполняет команды с подтверждением в UI
+            - Терминал, файлы и веб-поиск: агент выполняет команды с подтверждением в UI
+            - Монтаж видео через ffmpeg (`media_probe` + `media_render`): обрезка, склейка, звук, субтитры, масштаб
             - Бесплатные модели: Google, Groq, Cerebras, Mistral, OpenRouter, NVIDIA, OVH (без ключа)
             - Топовые Claude Opus / GPT — по вашему ключу
         env:
