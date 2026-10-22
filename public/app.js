@@ -1,10 +1,11 @@
 'use strict';
 /* ============================================================
-   zx — ИИ-агент на бесплатных моделях (UI в духе claude.ai)
-   - агрегация бесплатных провайдеров (Google, Groq, Cerebras,
-     Mistral, OpenRouter:free, NVIDIA, OVH + свой endpoint)
-   - авто-режим: строит цепочку провайдеров и фейловерит при
-     лимитах/ошибках, стримит ответ, показывает, кто отвечал
+   zx — ИИ-агент для кода (UI в духе claude.ai)
+   - чат на бесплатных провайдерах (авто-фейловер при лимитах)
+     и топовых Claude / GPT по собственному ключу
+   - режим агента: модель вызывает инструменты (терминал,
+     чтение/запись файлов, список папки), сервер исполняет их
+     локально; каждое действие подтверждается в UI
    - ключи живут только в localStorage браузера
    ============================================================ */
 
@@ -13,12 +14,19 @@ const LS = { chats: 'zx.chats', keys: 'zx.keys', settings: 'zx.settings', models
 
 /* ---------------- состояние ---------------- */
 let CAT = { providers: [], priority: [] };
-let chats = [];            // [{id, title, createdAt, messages:[{role, content, think, provider, model, ms, failovers}]}]
+let WS = { workspace: '', platform: 'unknown', node: '' };
+let chats = [];
 let curId = null;
-let keys = {};             // { providerId: apiKey }
-let settings = { model: 'auto', system: '', custom: { url: '', key: '', model: '' } };
-let modelsCache = {};      // { providerId: { at, list:[] } }
-let streaming = null;      // { chatId, abort, stopped }
+let keys = {};
+let settings = {
+  model: 'auto',
+  system: '',
+  custom: { url: '', key: '', model: '' },
+  agent: { enabled: true, ask: true },
+};
+let modelsCache = {};
+let streaming = null;
+let sessionAllowAll = false;
 
 const CUSTOM_PROVIDER = () => ({
   id: 'custom',
@@ -36,6 +44,78 @@ const CUSTOM_PROVIDER = () => ({
 
 const byId = (pid) => (pid === 'custom' ? CUSTOM_PROVIDER() : CAT.providers.find((p) => p.id === pid));
 
+/* ---------------- инструменты агента ---------------- */
+const TOOLS_SCHEMA = [
+  {
+    type: 'function',
+    function: {
+      name: 'run_terminal',
+      description: 'Выполнить команду в терминале на машине пользователя (bash в Linux/macOS, cmd в Windows) и получить stdout/stderr/код выхода. Используй для сборки, тестов, git, установки пакетов.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'команда для выполнения' },
+          cwd: { type: 'string', description: 'подпапка рабочей области (необязательно)' },
+        },
+        required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Прочитать текстовый файл с диска пользователя.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'путь к файлу (относительный рабочей папки или абсолютный)' } },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Создать или полностью перезаписать текстовый файл. Папки создаются автоматически.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'путь к файлу' },
+          content: { type: 'string', description: 'полное содержимое файла' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_dir',
+      description: 'Показать список файлов и папок.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'папка (по умолчанию рабочая)' } },
+        required: [],
+      },
+    },
+  },
+];
+
+const TOOL_LABELS = { run_terminal: 'Терминал', read_file: 'Читаю файл', write_file: 'Пишу файл', list_dir: 'Список файлов' };
+
+function agentSystem() {
+  if (!settings.agent?.enabled || !WS.workspace) return '';
+  return [
+    'Ты — zx, агент-помощник по программированию, работающий на машине пользователя.',
+    `Рабочая папка: ${WS.workspace} (платформа: ${WS.platform}).`,
+    'Доступные инструменты: run_terminal (команды терминала), read_file, write_file, list_dir.',
+    'Перед правками сначала смотри реальные файлы (read_file/list_dir), не выдумывай их содержимое.',
+    'После изменений запускай проверки (тесты/сборку) через run_terminal и разбирай ошибки.',
+    'Каждое действие пользователь подтверждает вручную. Отвечай кратко, по делу, на русском.',
+  ].join(' ');
+}
+
 /* ---------------- утилиты ---------------- */
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -43,9 +123,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 
-function persistChats() {
-  save(LS.chats, { chats: chats.slice(0, 60), curId });
-}
+function persistChats() { save(LS.chats, { chats: chats.slice(0, 60), curId }); }
 const curChat = () => chats.find((c) => c.id === curId) || null;
 
 let toastTimer = null;
@@ -106,6 +184,35 @@ function renderMarkdown(text, extraThink = '') {
   return html;
 }
 
+/* ---------------- карточки действий агента ---------------- */
+function toolCardHtml(st) {
+  const label = TOOL_LABELS[st.tool] || st.tool;
+  let short = '', detail = '';
+  if (st.tool === 'run_terminal') {
+    short = '$ ' + st.args.command;
+    detail = [st.result?.stdout, st.result?.stderr].filter(Boolean).join('\n');
+  } else if (st.tool === 'write_file') {
+    short = st.args.path + ` (${(st.args.content || '').length} симв.)`;
+    detail = (st.args.content || '').split('\n').slice(0, 12).join('\n');
+  } else {
+    short = st.args.path || '.';
+    detail = st.tool === 'read_file' ? String(st.result?.content || '').split('\n').slice(0, 12).join('\n')
+      : (st.result?.entries || []).join('  ');
+  }
+  const status = st.pending ? '⏳' : (st.denied ? '✕ отклонено' : (st.ok ? '✓' : '✗ код ' + (st.result?.exitCode ?? '?')));
+  return `<div class="tool-card ${st.ok === false && !st.pending && !st.denied ? 'tool-err' : ''}">` +
+    `<div class="tool-head"><span class="tool-ico">⚙</span><b>${esc(label)}</b>` +
+    `<span class="tool-args">${esc(short.length > 110 ? short.slice(0, 110) + '…' : short)}</span>` +
+    `<span class="tool-status">${status}</span></div>` +
+    (detail ? `<details${st.ok === false ? ' open' : ''}><summary>подробнее</summary><pre>${esc(detail.slice(0, 4000))}</pre></details>` : '') +
+    `</div>`;
+}
+
+function stepsHtml(m) {
+  if (!m.steps?.length) return '';
+  return `<div class="steps">${m.steps.map(toolCardHtml).join('')}</div>`;
+}
+
 /* ---------------- чаты ---------------- */
 function newChat(silent = false) {
   if (streaming) stopStreaming();
@@ -143,6 +250,7 @@ function renderAll() {
   renderThread();
   renderProvStatus();
   renderModelPill();
+  renderAgentChip();
   $('#main').classList.toggle('centered', !curChat() || curChat().messages.length === 0);
 }
 
@@ -166,20 +274,19 @@ function msgHtml(m, i) {
   if (m.role === 'user') {
     return `<div class="msg-user" data-i="${i}"><div class="bubble">${esc(m.content)}</div></div>`;
   }
-  const badge = m.badge || '';
   const actions = `
     <div class="meta-row">
-      <span class="msg-badge">${badge}</span>
+      <span class="msg-badge">${m.badge || ''}</span>
       <div class="msg-actions">
         <button class="icon-btn act-copy" title="Скопировать"><svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 9h10v12H9zM5 15V3h10"/></svg></button>
         <button class="icon-btn act-regen" title="Переписать ответ"><svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M4 10a8 8 0 1 1 2 6.5M4 10V4m0 6h6"/></svg></button>
       </div>
     </div>`;
   const err = m.error ? `<div class="error-card">${m.error}</div>` : '';
-  const body = (m.content || '').trim()
-    ? `<div class="content">${renderMarkdown(m.content, m.think)}</div>`
-    : (m.error ? '' : '<div class="content"><span class="cursor"></span></div>');
-  return `<div class="msg-assistant" data-i="${i}">${err}${body}${actions}</div>`;
+  const bodyHtml = (m.content || '').trim()
+    ? renderMarkdown(m.content, m.think)
+    : (m.error ? '' : '<span class="cursor"></span>');
+  return `<div class="msg-assistant" data-i="${i}">${err}${stepsHtml(m)}<div class="content">${bodyHtml}</div>${actions}</div>`;
 }
 
 function badgeFor(m) {
@@ -188,9 +295,9 @@ function badgeFor(m) {
   if (m.model) parts.push(`<span style="font-family:ui-monospace,Menlo,monospace;font-size:11px">${esc(m.model)}</span>`);
   if (m.ms) parts.push(((m.ms) / 1000).toFixed(1) + ' с');
   if (m.stopped) parts.push('остановлено');
-  if (m.failovers && m.failovers.length) {
-    const f = m.failovers.map((x) => `${x.provider} (${x.reason})`).join(' → ');
-    parts.push(`<span title="${esc(f)}">↻ обход: ${esc(m.failovers.map((x) => x.provider).join(' → '))}</span>`);
+  if (m.steps?.length) parts.push(`⚙ ${m.steps.length} действ.`, );
+  if (m.failovers?.length) {
+    parts.push(`<span title="${esc(m.failovers.map((x) => `${x.provider} (${x.reason})`).join(' → '))}">↻ обход: ${esc(m.failovers.map((x) => x.provider).join(' → '))}</span>`);
   }
   return parts.join(' · ');
 }
@@ -218,7 +325,7 @@ function bindMsgActions(wrap) {
   });
   wrap.querySelectorAll('.codeblock-copy').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const code = codeStore.get(btn.dataset.codeId) || btn.dataset.code || '';
+      const code = codeStore.get(btn.dataset.codeId) || '';
       navigator.clipboard.writeText(code).then(() => { btn.textContent = 'Скопировано'; setTimeout(() => (btn.textContent = 'Копировать'), 1400); });
     });
   });
@@ -231,10 +338,26 @@ function scrollBottom(force = false) {
 }
 
 function renderProvStatus() {
-  const ready = CAT.providers.filter((p) => p.keyless || keys[p.id]).length;
+  const freeReady = CAT.providers.filter((p) => !p.paid && (p.keyless || keys[p.id])).length;
+  const paidReady = CAT.providers.filter((p) => p.paid && keys[p.id]).length;
   const customReady = settings.custom.url && settings.custom.model ? 1 : 0;
   const el = $('#provStatus');
-  el.innerHTML = `<span class="dot ${ready ? 'ok' : ''}"></span> готово провайдеров: ${ready}${customReady ? ' + свой' : ''}`;
+  el.innerHTML = `<span class="dot ${freeReady ? 'ok' : ''}"></span> бесплатно: ${freeReady}` +
+    (paidReady ? ` · топ: ${paidReady}` : '') + (customReady ? ' + свой' : '');
+}
+
+function renderAgentChip() {
+  const btn = $('#agentBtn');
+  if (!btn) return;
+  const on = !!settings.agent?.enabled;
+  btn.classList.toggle('active', on);
+  btn.title = on ? 'Агент включён: терминал и файлы (нажмите, чтобы выключить)' : 'Агент выключен (нажмите, чтобы включить)';
+  const hint = $('#composerHint');
+  if (hint) {
+    hint.textContent = on && WS.workspace
+      ? `агент: ${WS.platform === 'win32' ? 'Windows' : WS.platform} · ${WS.workspace}`
+      : (on ? 'агент: терминал и файлы' : '');
+  }
 }
 
 /* ---------------- композер ---------------- */
@@ -259,6 +382,58 @@ input.addEventListener('keydown', (e) => {
 $('#sendBtn').addEventListener('click', () => (streaming ? stopStreaming() : sendMessage()));
 $('#newChatBtn').addEventListener('click', () => newChat());
 $('#plusBtn').addEventListener('click', () => toast('Вложения файлов — скоро'));
+$('#agentBtn').addEventListener('click', () => {
+  settings.agent = settings.agent || { enabled: true, ask: true };
+  settings.agent.enabled = !settings.agent.enabled;
+  save(LS.settings, settings);
+  renderAgentChip();
+  toast(settings.agent.enabled ? 'Агент включён: могу выполнять команды и править файлы' : 'Агент выключен: обычный чат');
+});
+
+/* ---------------- подтверждение действий ---------------- */
+function approvalDetail(call) {
+  if (call.name === 'run_terminal') return `$ ${call.args.command}\n# в ${call.args.cwd || WS.workspace || '.'}`;
+  if (call.name === 'write_file') {
+    const lines = String(call.args.content || '').split('\n');
+    return `${call.args.path} — записать ${lines.length} строк:\n\n` + lines.slice(0, 30).join('\n') + (lines.length > 30 ? '\n…' : '');
+  }
+  return call.args.path || '(рабочая папка)';
+}
+
+function requestApproval(call) {
+  if (sessionAllowAll) return Promise.resolve('allow');
+  return new Promise((resolve) => {
+    const modal = $('#approveModal');
+    $('#apToolName').textContent = `${TOOL_LABELS[call.name] || call.name} · ${call.provider || ''}`;
+    $('#apDetail').textContent = approvalDetail(call);
+    $('#apSession').checked = false;
+    modal.hidden = false;
+    const done = (v) => { modal.hidden = true; cleanup(); resolve(v); };
+    const onAllow = () => { if ($('#apSession').checked) sessionAllowAll = true; done('allow'); };
+    const onDeny = () => done('deny');
+    function cleanup() {
+      $('#apAllowBtn').removeEventListener('click', onAllow);
+      $('#apDenyBtn').removeEventListener('click', onDeny);
+    }
+    $('#apAllowBtn').addEventListener('click', onAllow);
+    $('#apDenyBtn').addEventListener('click', onDeny);
+  });
+}
+
+async function execTool(call) {
+  const verdict = await requestApproval(call);
+  if (verdict === 'deny') return { denied: true, result: { ok: false, error: 'пользователь отклонил действие' } };
+  try {
+    const res = await fetch('/api/tools/exec', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tool: call.name, args: call.args }),
+    });
+    return { denied: false, result: await res.json() };
+  } catch (e) {
+    return { denied: false, result: { ok: false, error: 'не удалось выполнить: ' + e.message } };
+  }
+}
 
 /* ---------------- получение моделей провайдеров ---------------- */
 function filterModels(p, list) {
@@ -269,6 +444,16 @@ function filterModels(p, list) {
   return [...new Set(out)];
 }
 
+function authHeaders(p, key) {
+  const h = {};
+  if (key) {
+    h.authorization = `Bearer ${key}`;
+    if (p.authStyle === 'anthropic') h['x-api-key'] = key;
+  }
+  if (p.extraHeaders) Object.assign(h, p.extraHeaders);
+  return h;
+}
+
 async function fetchModels(p) {
   const cached = modelsCache[p.id];
   if (cached && cached.list?.length && Date.now() - cached.at < 3600e3) return cached.list;
@@ -276,7 +461,7 @@ async function fetchModels(p) {
   const url = p.baseUrl + '/models';
   let list = null;
   try {
-    const res = await fetch(url, { headers: key ? { authorization: `Bearer ${key}` } : {} });
+    const res = await fetch(url, { headers: authHeaders(p, key) });
     if (res.ok) list = (await res.json())?.data?.map((m) => String(m.id).replace(/^models\//, '')) || null;
   } catch { /* CORS/сеть — пробуем через сервер */ }
   if (!list) {
@@ -284,7 +469,7 @@ async function fetchModels(p) {
       const res = await fetch('/api/proxy', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ url, key, method: 'GET' }),
+        body: JSON.stringify({ url, key, method: 'GET', authStyle: p.authStyle, extraHeaders: p.extraHeaders }),
       });
       if (res.ok) list = (await res.json())?.data?.map((m) => String(m.id).replace(/^models\//, '')) || null;
     } catch {}
@@ -300,7 +485,7 @@ function pickModel(p) {
   if (list.length) {
     const hit = (p.picks || []).find((x) => list.includes(x));
     if (hit) return hit;
-    const prefs = [/flash-lite/i, /flash/i, /mini/i, /small/i, /120b/i, /70b/i, /32b/i, /8b/i];
+    const prefs = [/opus-5/i, /gpt-5\.6/i, /gpt-5\.5/i, /flash-lite/i, /flash/i, /mini/i, /small/i, /120b/i, /70b/i, /32b/i, /8b/i];
     for (const re of prefs) {
       const m = list.find((id) => re.test(id));
       if (m) return m;
@@ -321,14 +506,14 @@ function buildChain() {
     const p = byId(sel.provider);
     if (p) chain.unshift({ provider: p, model: sel.model, key: p.custom ? settings.custom.key : (keys[p.id] || '') });
   }
+  // автоматом перебираем только бесплатные
   for (const pid of CAT.priority || []) {
     const p = byId(pid);
-    if (!p) continue;
+    if (!p || p.paid) continue;
     if (!p.keyless && !keys[p.id]) continue;
     const model = pickModel(p);
     if (model) chain.push({ provider: p, model, key: keys[p.id] || '' });
   }
-  // убираем дубликаты провайдер+модель
   const seen = new Set();
   return chain.filter((t) => {
     const k = t.provider.id + '|' + t.model;
@@ -341,8 +526,15 @@ function buildChain() {
 /* ---------------- стриминг с фейловером ---------------- */
 async function upstreamChat(target, payload, signal) {
   const url = target.provider.baseUrl + '/chat/completions';
-  const headers = { 'content-type': 'application/json' };
-  if (target.key) headers.authorization = `Bearer ${target.key}`;
+  const headers = { 'content-type': 'application/json', ...authHeaders(target.provider, target.key) };
+  const proxyBody = {
+    url,
+    key: target.key,
+    authStyle: target.provider.authStyle,
+    extraHeaders: target.provider.extraHeaders,
+    payload,
+    stream: true,
+  };
 
   // 1) прямой запрос из браузера
   try {
@@ -357,7 +549,7 @@ async function upstreamChat(target, payload, signal) {
   const res = await fetch('/api/proxy', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ url, key: target.key, payload, stream: true }),
+    body: JSON.stringify(proxyBody),
     signal,
   });
   const wrapped = wrapRes(res, true);
@@ -394,8 +586,9 @@ function wrapRes(res, isProxy) {
   };
 }
 
-async function streamTarget(target, messages, handlers, signal) {
+async function streamTarget(target, messages, handlers, signal, withTools) {
   const payload = { model: target.model, messages, stream: true };
+  if (withTools) payload.tools = TOOLS_SCHEMA;
   const res = await upstreamChat(target, payload, signal);
   if (signal?.aborted) throw { aborted: true };
 
@@ -418,9 +611,11 @@ async function streamTarget(target, messages, handlers, signal) {
     if (got === 0 && /^\s*\{/.test(buf) && buf.includes('"choices"') && !buf.includes('data:')) {
       try {
         const j = JSON.parse(buf);
-        const c = j.choices?.[0]?.message?.content || '';
         if (j.error) throw { failover: true, status: 0, detail: j.error?.message || 'ошибка провайдера' };
+        const msg = j.choices?.[0]?.message || {};
+        const c = typeof msg.content === 'string' ? msg.content : '';
         if (c) { got += c.length; handlers.onDelta(c); }
+        if (Array.isArray(msg.tool_calls)) for (const tc of msg.tool_calls) handlers.onToolCall(tc);
         return;
       } catch (e) {
         if (e && e.failover) throw e;
@@ -440,9 +635,10 @@ async function streamTarget(target, messages, handlers, signal) {
       const d = j.choices?.[0]?.delta || {};
       if (d.reasoning_content) handlers.onThink(d.reasoning_content);
       if (typeof d.content === 'string' && d.content) { got += d.content.length; handlers.onDelta(d.content); }
+      if (Array.isArray(d.tool_calls)) for (const tc of d.tool_calls) handlers.onToolCall(tc);
     }
   }
-  if (got === 0) throw { failover: true, status: 0, detail: 'пустой ответ' };
+  if (got === 0 && !handlers.hasToolCalls()) throw { failover: true, status: 0, detail: 'пустой ответ' };
 }
 
 function reasonLabel(status, detail) {
@@ -450,15 +646,16 @@ function reasonLabel(status, detail) {
   if (status === 429) return 'лимит';
   if (status >= 500) return 'ошибка сервера';
   if (status === 404) return 'модель недоступна';
+  if (status === 400 || status === 422) return 'запрос отклонён';
   return detail ? 'сбой' : 'недоступен';
 }
 
 /* ---------------- отправка ---------------- */
 function buildMessages(history) {
   const msgs = [];
-  const sys = (settings.system || '').trim();
+  const sys = [(settings.system || '').trim(), agentSystem()].filter(Boolean).join('\n\n');
   if (sys) msgs.push({ role: 'system', content: sys });
-  msgs.push(...history.slice(-24).map((m) => ({ role: m.role, content: m.content })));
+  msgs.push(...history.slice(-30).map((m) => ({ role: m.role, content: m.content })));
   return msgs;
 }
 
@@ -485,7 +682,6 @@ async function sendMessage() {
 async function regenerate() {
   const c = curChat();
   if (!c || streaming) return;
-  // убираем последний ассистентский ответ
   while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') c.messages.pop();
   persistChats();
   renderThread();
@@ -495,7 +691,7 @@ async function regenerate() {
 
 async function runCompletion(c) {
   const chain = buildChain();
-  const m = { role: 'assistant', content: '', think: '', provider: '', model: '', failovers: [], ms: 0 };
+  const m = { role: 'assistant', content: '', think: '', provider: '', model: '', failovers: [], ms: 0, steps: [] };
   c.messages.push(m);
   const wrap = $('#messages');
 
@@ -506,6 +702,18 @@ async function runCompletion(c) {
   scrollBottom(true);
   const t0 = performance.now();
 
+  const rerender = () => {
+    requestAnimationFrame(() => {
+      const cur = el.querySelector('.content');
+      const curSteps = el.querySelector('.steps');
+      const stepsHtmlNew = stepsHtml(m);
+      if (curSteps) curSteps.outerHTML = stepsHtmlNew;
+      else if (stepsHtmlNew) el.insertAdjacentHTML('afterbegin', stepsHtmlNew);
+      if (cur) cur.innerHTML = renderMarkdown(m.content, m.think) + '<span class="cursor"></span>';
+      scrollBottom();
+    });
+  };
+
   if (!chain.length) {
     m.error = '<b>Нет настроенных провайдеров.</b> Откройте Настройки и добавьте хотя бы один бесплатный ключ (Google AI Studio или Groq — самые щедрые), либо включите OVHcloud без ключа.';
     finishMsg();
@@ -514,55 +722,106 @@ async function runCompletion(c) {
 
   streaming = { chatId: c.id, abort: new AbortController(), stopped: false };
   updateSendBtn();
+  const agentOn = () => !!settings.agent?.enabled;
+  const baseHistory = buildMessages(c.messages.slice(0, -1));
+  const MAX_ITER = 15;
 
   for (const target of chain) {
     if (streaming.stopped) break;
     let started = false;
-    let renderQueued = false;
-    const rerender = () => {
-      if (renderQueued) return;
-      renderQueued = true;
-      requestAnimationFrame(() => {
-        renderQueued = false;
-        const cur = el.querySelector('.content');
-        if (cur) cur.innerHTML = renderMarkdown(m.content, m.think) + '<span class="cursor"></span>';
-        scrollBottom();
-      });
-    };
-    try {
-      await streamTarget(
-        target,
-        buildMessages(c.messages.slice(0, -1)),
-        {
-          onDelta: (d) => {
-            if (!started) {
-              started = true;
-              m.provider = target.provider.name;
-              m.model = target.model;
-            }
-            m.content += d;
-            rerender();
+    let apiMessages = baseHistory.slice();
+    let noTools = false; // провайдер не потянул tools — повторяем без них
+    let ok = false;
+
+    for (let iter = 0; iter < MAX_ITER; iter++) {
+      if (streaming.stopped) break;
+      const pending = new Map(); // index -> {id, name, argsStr}
+
+      try {
+        await streamTarget(
+          target,
+          apiMessages,
+          {
+            onDelta: (d) => {
+              if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
+              m.content += (m.content ? '' : '') + d;
+              rerender();
+            },
+            onThink: (d) => { m.think = (m.think || '') + d; rerender(); },
+            onToolCall: (tc) => {
+              if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
+              const idx = typeof tc.index === 'number' ? tc.index : pending.size;
+              const cur = pending.get(idx) || { id: tc.id || '', name: '', argsStr: '' };
+              if (tc.id) cur.id = tc.id;
+              if (tc.function?.name) cur.name = tc.function.name;
+              if (typeof tc.function?.arguments === 'string') cur.argsStr += tc.function.arguments;
+              else if (tc.function?.arguments && typeof tc.function.arguments === 'object') cur.argsStr = JSON.stringify(tc.function.arguments);
+              pending.set(idx, cur);
+            },
+            hasToolCalls: () => pending.size > 0,
           },
-          onThink: (d) => { m.think = (m.think || '') + d; rerender(); },
-        },
-        streaming.abort.signal
-      );
-      if (!m.provider) { m.provider = target.provider.name; m.model = target.model; }
-      m.ms = performance.now() - t0;
-      break; // успех
-    } catch (e) {
-      if (e && (e.aborted || e.name === 'AbortError' || streaming?.stopped)) {
-        m.stopped = true; m.ms = performance.now() - t0; break;
+          streaming.abort.signal,
+          agentOn() && !noTools
+        );
+
+        // == поток завершился ==
+        const calls = [...pending.values()].filter((x) => x.name);
+        if (agentOn() && calls.length) {
+          // фиксируем ответ ассистента с tool_calls в API-истории
+          apiMessages.push({
+            role: 'assistant',
+            content: m.content || '',
+            tool_calls: calls.map((x, i) => ({
+              id: x.id || `call_${iter}_${i}`,
+              type: 'function',
+              function: { name: x.name, arguments: x.argsStr || '{}' },
+            })),
+          });
+
+          for (const [i, call] of calls.entries()) {
+            let args = {};
+            try { args = JSON.parse(call.argsStr || '{}'); } catch { args = { _raw: call.argsStr }; }
+            const st = { tool: call.name, args, pending: true };
+            m.steps.push(st);
+            rerender();
+            const id = apiMessages[apiMessages.length - 1].tool_calls[i].id;
+            const { denied, result } = await execTool({ ...call, args, provider: target.provider.name });
+            st.pending = false; st.denied = denied; st.result = result; st.ok = !!result.ok;
+            rerender();
+            apiMessages.push({
+              role: 'tool',
+              tool_call_id: id,
+              content: JSON.stringify(result).slice(0, 8000),
+            });
+          }
+          continue; // следующий заход: модель видит результаты
+        }
+
+        if (!m.provider) { m.provider = target.provider.name; m.model = target.model; }
+        ok = true;
+        break; // обычный текстовый ответ — готово
+      } catch (e) {
+        if (e && (e.aborted || e.name === 'AbortError' || streaming?.stopped)) {
+          m.stopped = true; break;
+        }
+        // провайдер не умеет tools — пробуем ещё раз без них (той же моделью)
+        if (!noTools && agentOn() && (e.status === 400 || e.status === 422) && /tool|function/i.test(e.detail || '')) {
+          noTools = true;
+          apiMessages = baseHistory.slice();
+          m.content = ''; m.steps = [];
+          continue;
+        }
+        if (started) {
+          m.error = `<b>Провайдер оборвал поток.</b> ${esc(e.detail || '')}`;
+          break;
+        }
+        m.failovers.push({ provider: target.provider.name, reason: reasonLabel(e.status || 0, e.detail) });
+        if (e.detail) console.warn('zx failover:', target.provider.id, e.status, e.detail);
+        break; // к следующему провайдеру цепочки
       }
-      if (started) {
-        // стрим начался и оборвался — фейловер уже невозможен, показываем ошибку
-        m.error = `<b>Провайдер оборвал поток.</b> ${esc(e.detail || '')}`;
-        m.ms = performance.now() - t0;
-        break;
-      }
-      m.failovers.push({ provider: target.provider.name, reason: reasonLabel(e.status || 0, e.detail) });
-      if (e.detail) console.warn('zx failover:', target.provider.id, e.status, e.detail);
     }
+
+    if (ok || m.stopped || m.error) break;
   }
 
   // все провайдеры не ответили — объясняем, что случилось
@@ -571,11 +830,10 @@ async function runCompletion(c) {
       ? m.failovers.map((f) => `${esc(f.provider)} — ${f.reason}`).join(', ')
       : 'провайдеры не ответили';
     m.error = `<b>Никто из цепочки не ответил.</b> ${det}. Проверьте ключи в Настройках или попробуйте ещё раз — лимиты бесплатных тарифов сбрасываются ежедневно.`;
-    m.ms = performance.now() - t0;
   }
 
   function finishMsg() {
-    m.ms = m.ms || performance.now() - t0;
+    m.ms = performance.now() - t0;
     m.badge = badgeFor(m);
     persistChats();
     streaming = null;
@@ -583,10 +841,6 @@ async function runCompletion(c) {
     renderThread();
     renderSidebar();
     scrollBottom();
-    const keysReady = CAT.providers.some((p) => p.keyless || keys[p.id]);
-    if (!m.content && !m.error && !m.stopped && !keysReady) {
-      toast('Добавьте ключ провайдера в Настройках', true);
-    }
   }
   finishMsg();
 }
@@ -599,6 +853,7 @@ function stopStreaming() {
 
 /* ---------------- меню моделей ---------------- */
 const menu = $('#modelMenu');
+const menuRefreshed = new Set();
 
 function renderModelPill() {
   const sel = settings.model;
@@ -610,28 +865,24 @@ function renderModelPill() {
     dotOk = p ? (p.keyless || !!keys[p.id] || !!settings.custom.key) : false;
   }
   $('#modelPillLabel').textContent = label;
-  const dot = $('#modelPillDot');
-  dot.style.background = dotOk ? 'var(--accent)' : '#CFCCC0';
+  $('#modelPillDot').style.background = dotOk ? 'var(--accent)' : '#CFCCC0';
 }
 
-function modelMenuItem({ title, sub, selected, onclick, check }) {
+function modelMenuItem({ title, sub, selected, onclick }) {
   const el = document.createElement('button');
   el.className = 'menu-item' + (selected ? ' selected' : '');
-  el.innerHTML = `<span class="mi-title">${title}${selected ? '<span class="mi-check">✓</span>' : (check ? `<span class="mi-check">${check}</span>` : '')}</span>` +
+  el.innerHTML = `<span class="mi-title">${title}${selected ? '<span class="mi-check">✓</span>' : ''}</span>` +
     (sub ? `<span class="mi-sub">${sub}</span>` : '');
   el.addEventListener('click', onclick);
   return el;
 }
 
-const menuRefreshed = new Set();
-
 function buildMenuDom() {
   menu.innerHTML = '';
 
-  // «Авто»
   menu.appendChild(modelMenuItem({
     title: '✳ Авто',
-    sub: 'Лучший доступный провайдер, с авто-фейловером при лимитах',
+    sub: 'Лучший доступный бесплатный провайдер, с авто-фейловером при лимитах',
     selected: settings.model === 'auto',
     onclick: () => selectModel('auto'),
   }));
@@ -639,41 +890,59 @@ function buildMenuDom() {
 
   const sections = [...CAT.providers];
   if (settings.custom.url) sections.push(CUSTOM_PROVIDER());
+  const free = sections.filter((p) => !p.paid);
+  const paid = sections.filter((p) => p.paid);
 
-  for (const p of sections) {
-    const hasKey = p.keyless || (p.custom ? !!settings.custom.url : !!keys[p.id]);
-    const sec = document.createElement('div');
-    sec.className = 'menu-section';
-    sec.innerHTML = `<span>${esc(p.name)}</span><span class="tag">${esc(p.free)}</span>${hasKey ? '' : '<span style="text-transform:none;letter-spacing:0">· нужен ключ</span>'}`;
-    menu.appendChild(sec);
+  const renderGroup = (list) => {
+    for (const p of list) {
+      const hasKey = p.keyless || (p.custom ? !!settings.custom.url : !!keys[p.id]);
+      const sec = document.createElement('div');
+      sec.className = 'menu-section';
+      const tag = p.paid ? '<span class="tag paid">по ключу · платно</span>' : `<span class="tag">${esc(p.free)}</span>`;
+      sec.innerHTML = `<span>${esc(p.name)}</span>${tag}${hasKey ? '' : '<span style="text-transform:none;letter-spacing:0">· нужен ключ</span>'}`;
+      menu.appendChild(sec);
 
-    const picks = (p.picks || []).slice(0, 6);
-    const list = modelsCache[p.id]?.list || [];
-    const shown = (list.length ? list.slice(0, 14) : picks);
-    if (!shown.length) {
-      const hint = document.createElement('div');
-      hint.className = 'menu-foot';
-      hint.textContent = hasKey ? 'Список моделей загрузится…' : 'Добавьте ключ в Настройках, чтобы включить провайдера';
-      menu.appendChild(hint);
-      continue;
+      const list0 = modelsCache[p.id]?.list || [];
+      const picks = (p.picks || []).slice(0, 6);
+      const shown = (list0.length ? list0.slice(0, 14) : picks);
+      if (!shown.length) {
+        const hint = document.createElement('div');
+        hint.className = 'menu-foot';
+        hint.textContent = hasKey ? 'Список моделей загрузится…' : 'Добавьте ключ в Настройках, чтобы включить провайдера';
+        menu.appendChild(hint);
+        continue;
+      }
+      for (const id of shown) {
+        const isSel = settings.model !== 'auto' && settings.model?.provider === p.id && settings.model?.model === id;
+        menu.appendChild(modelMenuItem({
+          title: esc(id),
+          sub: hasKey ? '' : 'добавьте ключ в Настройках',
+          selected: isSel,
+          onclick: () => {
+            if (!hasKey) { openSettings(); toast(`Нужен ключ ${p.name}`, true); return; }
+            selectModel({ provider: p.id, model: id });
+          },
+        }));
+      }
     }
-    for (const id of shown) {
-      const isSel = settings.model !== 'auto' && settings.model?.provider === p.id && settings.model?.model === id;
-      menu.appendChild(modelMenuItem({
-        title: esc(id),
-        sub: hasKey ? '' : 'добавьте ключ в Настройках',
-        selected: isSel,
-        onclick: () => {
-          if (!hasKey) { openSettings(); toast(`Нужен ключ ${p.name}`, true); return; }
-          selectModel({ provider: p.id, model: id });
-        },
-      }));
-    }
+  };
+
+  renderGroup(free);
+
+  if (paid.length) {
+    const sep = document.createElement('div');
+    sep.className = 'menu-sep';
+    menu.appendChild(sep);
+    const head = document.createElement('div');
+    head.className = 'menu-section';
+    head.innerHTML = '<span>Топ-модели — ваш ключ</span>';
+    menu.appendChild(head);
+    renderGroup(paid);
   }
 
   const foot = document.createElement('div');
   foot.className = 'menu-foot';
-  foot.textContent = 'В «Авто» провайдеры перебираются по качеству: Google → Groq → Cerebras → Mistral → OpenRouter → NVIDIA → OVH';
+  foot.textContent = '«Авто» перебирает бесплатные: Google → Groq → Cerebras → Mistral → OpenRouter → NVIDIA → OVH. Claude и GPT — по явному выбору, тарифицируются вашим ключом.';
   menu.appendChild(foot);
 }
 
@@ -685,7 +954,6 @@ function openMenu() {
   menu.style.top = Math.min(pill.bottom + 6, window.innerHeight - 60) + 'px';
   menu.style.left = Math.max(8, Math.min(pill.left, window.innerWidth - 376)) + 'px';
 
-  // подтягиваем живые списки моделей (каждого провайдера — один раз за открытие)
   const sections = [...CAT.providers];
   if (settings.custom.url) sections.push(CUSTOM_PROVIDER());
   for (const p of sections) {
@@ -718,14 +986,18 @@ document.addEventListener('click', (e) => {
 function openSettings() {
   const rows = $('#keyRows');
   rows.innerHTML = '';
-  for (const p of CAT.providers) {
+  const order = [...CAT.providers].sort((a, b) => (a.paid === b.paid ? 0 : a.paid ? 1 : -1));
+  for (const p of order) {
     const row = document.createElement('div');
     row.className = 'key-row';
     const has = !!keys[p.id];
+    const tag = p.keyless
+      ? '<span class="key-free keyless">без ключа</span>'
+      : (p.paid ? '<span class="key-free paid">топ · платно</span>' : '<span class="key-free">бесплатно</span>');
     row.innerHTML = `
       <span class="key-dot ${has ? 'ok' : ''}"></span>
       <div class="key-main">
-        <div class="key-name">${esc(p.name)} <span class="key-free ${p.keyless ? 'keyless' : ''}">${p.keyless ? 'без ключа' : 'бесплатно'}</span></div>
+        <div class="key-name">${esc(p.name)} ${tag}</div>
         <div class="key-note">${esc(p.note)}</div>
       </div>
       ${p.keyless ? '<span class="key-note">включён всегда</span>' : `
@@ -782,7 +1054,8 @@ $('#scrim').addEventListener('click', closeSidebar);
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
-    if (!menu.hidden) menu.hidden = true;
+    if (!$('#approveModal').hidden) { /* ждём явного решения */ }
+    else if (!menu.hidden) menu.hidden = true;
     else if (!$('#settingsModal').hidden) closeSettings();
     else closeSidebar();
   }
@@ -794,15 +1067,17 @@ async function boot() {
   chats = Array.isArray(saved?.chats) ? saved.chats : [];
   curId = saved?.curId || null;
   keys = load(LS.keys, {}) || {};
-  settings = Object.assign({ model: 'auto', system: '', custom: { url: '', key: '', model: '' } }, load(LS.settings, {}));
+  settings = Object.assign({ model: 'auto', system: '', custom: {}, agent: {} }, load(LS.settings, {}));
   settings.custom = Object.assign({ url: '', key: '', model: '' }, settings.custom || {});
+  settings.agent = Object.assign({ enabled: true, ask: true }, settings.agent || {});
   modelsCache = load(LS.models, {}) || {};
 
   try {
-    const r = await fetch('/api/providers');
+    const [r, w] = await Promise.all([fetch('/api/providers'), fetch('/api/agent/info')]);
     CAT = await r.json();
+    WS = await w.json();
   } catch {
-    toast('Не удалось загрузить каталог провайдеров', true);
+    toast('Не удалось связаться с сервером zx', true);
   }
 
   if (!chats.find((c) => c.id === curId)) curId = chats[0]?.id || null;

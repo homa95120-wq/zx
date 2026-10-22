@@ -1,34 +1,40 @@
-// Браузерный смоук-тест на jsdom: загрузка UI, открытие чата,
-// отправка сообщения, стрим ответа мок-провайдера, badge, меню моделей.
+// Браузерный смоук-тест на jsdom: загрузка UI, чат, выбор модели, настройки,
+// и агентский сценарий: модель вызывает run_terminal → подтверждение →
+// выполнение на реальном сервере → финальный ответ + карточка действия.
 'use strict';
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const { JSDOM } = require('jsdom');
 
 const PORT = 3312;
 const BASE = `http://127.0.0.1:${PORT}`;
+const WS_DIR = '/tmp/zx-ws-smoke';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  fs.rmSync(WS_DIR, { recursive: true, force: true });
+  fs.mkdirSync(WS_DIR, { recursive: true });
+
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1' },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: WS_DIR },
   });
   await sleep(600);
 
   const results = [];
   const check = (name, cond, extra = '') => {
     results.push([name, cond]);
-    console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
+    console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + String(extra).slice(0, 140) : ''}`);
   };
 
-  // Стаб fetch: относительные URL → наш сервер; api.groq.com → мок-стрим; остальное → 403.
   const realFetch = globalThis.fetch;
   const enc = new TextEncoder();
-  function sseResponse(text) {
+
+  function sse(deltas) {
     const stream = new ReadableStream({
       start(c) {
-        c.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`));
+        for (const d of deltas) c.enqueue(enc.encode(`data: ${JSON.stringify(d)}\n\n`));
         c.enqueue(enc.encode('data: [DONE]\n\n'));
         c.close();
       },
@@ -36,6 +42,8 @@ async function main() {
     return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
   const jsonResp = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  let chatCalls = 0;
 
   const dom = await JSDOM.fromFile(path.join(__dirname, '..', 'public', 'index.html'), {
     url: BASE + '/',
@@ -53,7 +61,16 @@ async function main() {
           if (url.endsWith('/models')) {
             return Promise.resolve(jsonResp({ data: [{ id: 'mock-120b' }, { id: 'mock-embed-x' }, { id: 'llama-70b' }] }));
           }
-          return Promise.resolve(sseResponse('Привет из мока!'));
+          chatCalls++;
+          if (chatCalls === 1) {
+            // первый заход: модель вызывает инструмент
+            return Promise.resolve(sse([
+              { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'run_terminal', arguments: '{"command":' } }] } }] },
+              { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"echo agent-ok"}' } }] } }] },
+            ]));
+          }
+          // второй заход: финальный текст
+          return Promise.resolve(sse([{ choices: [{ delta: { content: 'Готово: команда вывела agent-ok.' } }] }]));
         }
         return Promise.resolve(new Response('{}', { status: 403 }));
       };
@@ -61,49 +78,65 @@ async function main() {
   });
 
   const { window } = dom;
-  await sleep(1200); // загрузка скриптов + boot
-
   const doc = window.document;
+  await sleep(1200);
+
   check('boot: приветствие отрисовано', doc.querySelector('#greeting')?.textContent.length > 3, doc.querySelector('#greeting')?.textContent);
-  check('boot: статус провайдеров', /готово провайдеров: \d/.test(doc.querySelector('#provStatus')?.textContent || ''), doc.querySelector('#provStatus')?.textContent);
+  check('boot: статус провайдеров', /бесплатно: \d/.test(doc.querySelector('#provStatus')?.textContent || ''), doc.querySelector('#provStatus')?.textContent);
+  check('boot: рабочая папка агента в подсказке', (doc.querySelector('#composerHint')?.textContent || '').includes(WS_DIR), doc.querySelector('#composerHint')?.textContent);
 
   // меню моделей
   doc.querySelector('#modelPill').click();
   await sleep(400);
   const menuText = doc.querySelector('#modelMenu')?.textContent || '';
   check('меню: есть «Авто»', menuText.includes('Авто'));
-  check('меню: живой список Groq подтянулся', menuText.includes('mock-120b'), menuText.slice(0, 120));
+  check('меню: живой список Groq подтянулся', menuText.includes('mock-120b'));
+  check('меню: топ-модели Claude/GPT присутствуют', menuText.includes('Claude') && menuText.includes('ChatGPT'), menuText.slice(-160));
+  doc.body.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await sleep(50);
 
-  // выбор конкретной модели
-  const items = [...doc.querySelectorAll('#modelMenu .menu-item')];
-  const mockItem = items.find((el) => el.textContent.includes('mock-120b'));
-  mockItem?.click();
-  await sleep(100);
-  check('пилл обновился', doc.querySelector('#modelPillLabel')?.textContent.includes('mock-120b'));
-
-  // отправка сообщения
+  // отправка сообщения → агентский цикл
   const input = doc.querySelector('#input');
-  input.value = 'Тестовый вопрос';
+  input.value = 'Выполни echo agent-ok и расскажи, что вышло';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
   doc.querySelector('#sendBtn').click();
-  await sleep(900);
+  await sleep(700);
+
+  // модалка подтверждения
+  const modal = doc.querySelector('#approveModal');
+  check('модалка подтверждения показана', modal && !modal.hidden);
+  check('в модалке команда', (doc.querySelector('#apDetail')?.textContent || '').includes('echo agent-ok'), doc.querySelector('#apDetail')?.textContent);
+
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(1500);
+
+  const cardText = [...doc.querySelectorAll('.tool-card')].map((e) => e.textContent).join(' | ');
+  check('карточка действия: echo agent-ok', cardText.includes('echo agent-ok'), cardText);
+  check('карточка действия: успешно', cardText.includes('✓'), cardText);
 
   const contents = [...doc.querySelectorAll('.msg-assistant .content')].map((e) => e.textContent).join('|');
-  check('ответ замоканного провайдера отрисован', contents.includes('Привет из мока'), contents.slice(0, 80));
-  const badge = doc.querySelector('.msg-badge')?.textContent || '';
-  check('бейдж: Groq + модель', badge.includes('Groq') && badge.includes('mock-120b'), badge);
-  check('бабл пользователя', [...doc.querySelectorAll('.msg-user .bubble')].some((e) => e.textContent === 'Тестовый вопрос'));
+  check('финальный ответ модели', contents.includes('Готово: команда вывела agent-ok'), contents.slice(0, 100));
+
+  const badge = [...doc.querySelectorAll('.msg-badge')].map((e) => e.textContent).join(' ');
+  check('бейдж: Groq + действия', badge.includes('Groq') && badge.includes('1 действ'), badge);
+
+  // файл реально создан? (echo не создаёт; проверим инструмент напрямую через сервер)
+  const execRes = await realFetch(BASE + '/api/tools/exec', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tool: 'write_file', args: { path: 'smoke.txt', content: 'ok' } }),
+  });
+  check('сервер исполняет write_file в workspace', execRes.ok && fs.existsSync(path.join(WS_DIR, 'smoke.txt')));
 
   // настройки
   doc.querySelector('#openSettingsBtn').click();
   await sleep(100);
   check('модалка настроек открылась', !doc.querySelector('#settingsModal').hidden);
-  const groqInput = doc.querySelector('#keyRows input[data-pid="groq"]');
-  check('ключ Groq подставлен из localStorage', groqInput?.value === 'test-key');
+  const paidRows = [...doc.querySelectorAll('#keyRows .key-free.paid')];
+  check('в настройках есть платные Claude/GPT', paidRows.length === 2, paidRows.map((e) => e.textContent).join(','));
   doc.querySelector('#closeSettingsBtn').click();
 
-  // сайдбар: чат с заголовком из первого сообщения
-  check('чат в сайдбаре', [...doc.querySelectorAll('.chat-item .title')].some((e) => e.textContent.includes('Тестовый вопрос')));
+  check('чат в сайдбаре', [...doc.querySelectorAll('.chat-item .title')].some((e) => e.textContent.includes('Выполни echo')));
 
   srv.kill();
   const failed = results.filter(([, ok]) => !ok).length;

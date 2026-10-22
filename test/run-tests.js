@@ -27,7 +27,7 @@ async function main() {
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1' },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: '/tmp/zx-ws-test' },
   });
   await new Promise((r) => setTimeout(r, 700));
 
@@ -73,6 +73,34 @@ async function main() {
     stream: true,
   }), { 'content-type': 'application/json' });
   check('прокси пробрасывает 429', bad.status === 429 && bad.body.includes('rate limit'));
+
+
+  // 4b. инструменты агента
+  const fs = require('fs');
+  fs.rmSync('/tmp/zx-ws-test', { recursive: true, force: true });
+  fs.mkdirSync('/tmp/zx-ws-test', { recursive: true });
+
+  const exec = async (body) => req('POST', '/api/tools/exec', JSON.stringify(body), { 'content-type': 'application/json' });
+
+  const term = await exec({ tool: 'run_terminal', args: { command: 'echo hello-agent' } });
+  const termJ = JSON.parse(term.body);
+  check('run_terminal: echo', termJ.ok === true && termJ.stdout.includes('hello-agent'), JSON.stringify(termJ).slice(0, 120));
+
+  const wf = await exec({ tool: 'write_file', args: { path: 'sub/hello.txt', content: 'привет, агент' } });
+  check('write_file: создаёт файл', JSON.parse(wf.body).ok === true);
+
+  const rf = await exec({ tool: 'read_file', args: { path: 'sub/hello.txt' } });
+  check('read_file: читает файл', JSON.parse(rf.body).content === 'привет, агент');
+
+  const ld = await exec({ tool: 'list_dir', args: {} });
+  const ldJ = JSON.parse(ld.body);
+  check('list_dir: видит файлы', ldJ.ok === true && ldJ.entries.includes('sub/'));
+
+  const unk = await exec({ tool: 'hack', args: {} });
+  check('неизвестный инструмент отклонён', unk.status === 400);
+
+  const info = await req('GET', '/api/agent/info');
+  check('agent/info: workspace', JSON.parse(info.body).workspace === '/tmp/zx-ws-test');
 
   // 5. защита от левых url
   const evil = await req('POST', '/api/proxy', JSON.stringify({ url: 'ftp://evil', payload: {} }), { 'content-type': 'application/json' });

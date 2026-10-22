@@ -1,0 +1,57 @@
+name: Build zx-agent.exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'arena/**']
+    paths-ignore: ['**.md', 'test/**']
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Tests
+        run: npm test
+        shell: bash
+        env:
+          ZX_NO_OPEN: '1'
+
+      - name: Build exe
+        run: npm run build:exe
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zx-agent-exe
+          path: release/zx-agent.exe
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zx-agent-v1.1.0
+          name: zx-agent v1.1.0 — Windows .exe
+          files: release/zx-agent.exe
+          body: |
+            zx — ИИ-агент для кода в одном файле.
+
+            **Запуск:** скачайте `zx-agent.exe`, двойной клик — откроется браузер с приложением.
+            Консольное окно закрывать не нужно (это сервер агента). Остановка: Ctrl+C в консоли или закрыть окно.
+
+            - Терминал и файлы: агент выполняет команды с подтверждением в UI
+            - Бесплатные модели: Google, Groq, Cerebras, Mistral, OpenRouter, NVIDIA, OVH (без ключа)
+            - Топовые Claude Opus / GPT — по вашему ключу
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

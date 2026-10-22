@@ -424,3 +424,63 @@ details.think .think-body { padding: 2px 14px 10px; white-space: pre-wrap; line-
   .key-input-wrap { width: 100%; }
   .menu { width: min(360px, calc(100vw - 20px)); }
 }
+
+/* ---------- Режим агента ---------- */
+.agent-btn.active { color: var(--accent-strong); background: var(--accent-soft); }
+
+.steps { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.tool-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #F5F3EB;
+  overflow: hidden;
+  font-size: 13px;
+}
+.tool-card.tool-err { border-color: #E8CFC5; background: #FBF1EC; }
+.tool-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; min-width: 0; }
+.tool-ico { color: var(--accent-strong); flex-shrink: 0; }
+.tool-head b { font-weight: 600; white-space: nowrap; }
+.tool-args {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px; color: #55534B;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tool-status { flex-shrink: 0; font-size: 12px; color: var(--ok); font-weight: 600; }
+.tool-card.tool-err .tool-status { color: var(--err); }
+.tool-card details { border-top: 1px dashed var(--border); }
+.tool-card summary { cursor: pointer; padding: 5px 12px; font-size: 11.5px; color: var(--text-2); user-select: none; }
+.tool-card pre {
+  margin: 0; padding: 8px 12px 10px;
+  max-height: 260px; overflow: auto;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5;
+  color: #3E3C35; white-space: pre-wrap; word-break: break-word;
+}
+
+/* ---------- Модалка подтверждения ---------- */
+.modal.approve { width: 560px; }
+.ap-detail {
+  background: #201F1D; color: #E8E6DC;
+  border-radius: 12px;
+  padding: 13px 16px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.55;
+  max-height: 300px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+  margin: 0 0 12px;
+}
+.ap-remember { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #55534B; cursor: pointer; }
+.ap-remember input { accent-color: var(--accent); width: 15px; height: 15px; }
+.btn-ghost {
+  font-size: 14px; font-weight: 600;
+  padding: 9px 18px; border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: #3E3C35;
+}
+.btn-ghost:hover { background: var(--bg-hover); }
+
+/* платные провайдеры */
+.key-free.paid, .tag.paid {
+  color: var(--warn); background: #F7EEDD;
+}

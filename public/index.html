@@ -50,7 +50,7 @@
       <div class="empty-state" id="emptyState">
         <svg class="empty-logo" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z"/></svg>
         <h1 class="greeting" id="greeting">Доброе утро</h1>
-        <p class="empty-sub">Агент на бесплатных моделях — Gemini, GPT-OSS, DeepSeek, GLM, Qwen и Llama.<br>Сам выбирает доступного провайдера и переключается при лимитах.</p>
+        <p class="empty-sub">Агент для кода: выполняет команды в терминале, читает и пишет файлы,<br>отвечает через бесплатные модели (Gemini, GPT-OSS, DeepSeek, Qwen) —<br>или через топовые Claude и GPT по вашему ключу.</p>
       </div>
       <div class="messages" id="messages"></div>
     </div>
@@ -59,6 +59,9 @@
       <div class="composer" id="composer">
         <textarea id="input" rows="1" placeholder="Спросите что угодно…"></textarea>
         <div class="composer-bar">
+          <button class="icon-btn agent-btn" id="agentBtn" title="Агент: терминал и файлы">
+            <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5a4.5 4.5 0 0 0-6 6L3 18l3 3 5.5-5.5a4.5 4.5 0 0 0 6-6L15 12l-3-3 2.5-2.5z"/></svg>
+          </button>
           <button class="icon-btn" id="plusBtn" title="Вложения — скоро">
             <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
           </button>
@@ -106,6 +109,24 @@
     <div class="modal-foot">
       <span class="modal-note">Ничего не отправляется на наш сервер — только выбранному провайдеру.</span>
       <button class="btn-accent" id="saveSettingsBtn">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="approveModal" hidden>
+  <div class="modal approve">
+    <div class="modal-head">
+      <h2 id="apToolName">Разрешить действие?</h2>
+    </div>
+    <div class="modal-body">
+      <p class="section-sub">Агент просит выполнить действие на вашем компьютере. Проверьте его внимательно.</p>
+      <pre class="ap-detail" id="apDetail"></pre>
+      <label class="ap-remember"><input type="checkbox" id="apSession"> Больше не спрашивать в этой сессии</label>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-note">Действие выполнится локально в рабочей папке агента.</span>
+      <button class="btn-ghost" id="apDenyBtn">Отклонить</button>
+      <button class="btn-accent" id="apAllowBtn">Разрешить</button>
     </div>
   </div>
 </div>
