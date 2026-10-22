@@ -61,12 +61,14 @@
 
     <div class="composer-wrap" id="composerWrap">
       <div class="composer" id="composer">
-        <textarea id="input" rows="1" placeholder="Спросите что угодно…"></textarea>
+        <div class="attach-row" id="attachRow" hidden></div>
+        <textarea id="input" rows="1" placeholder="Спросите что угодно — или перетащите файл любого размера"></textarea>
+        <input type="file" id="fileInput" multiple hidden>
         <div class="composer-bar">
           <button class="icon-btn agent-btn" id="agentBtn" title="Агент: терминал и файлы">
             <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5a4.5 4.5 0 0 0-6 6L3 18l3 3 5.5-5.5a4.5 4.5 0 0 0 6-6L15 12l-3-3 2.5-2.5z"/></svg>
           </button>
-          <button class="icon-btn" id="plusBtn" title="Вложения — скоро">
+          <button class="icon-btn" id="plusBtn" title="Прикрепить файл любого размера">
             <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
           </button>
           <span class="composer-hint" id="composerHint"></span>

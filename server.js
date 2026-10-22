@@ -38,7 +38,7 @@ function send(res, code, obj) {
   res.end(body);
 }
 
-function readBody(req, limit = 20 * 1024 * 1024) {
+function readBodyRaw(req, limit = 64 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -47,9 +47,13 @@ function readBody(req, limit = 20 * 1024 * 1024) {
       if (size > limit) { reject(new Error('payload too large')); req.destroy(); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+function readBody(req, limit) {
+  return readBodyRaw(req, limit).then((b) => b.toString('utf8'));
 }
 
 function isAllowedUpstream(raw) {
@@ -91,6 +95,7 @@ async function handleProxy(req, res) {
   const ac = new AbortController();
   req.on('close', () => ac.abort());
 
+  const killTimer = setTimeout(() => { try { ac.abort(); } catch {} }, 45 * 1000);
   let up;
   try {
     up = await fetch(url, {
@@ -99,7 +104,9 @@ async function handleProxy(req, res) {
       body: method === 'GET' ? undefined : JSON.stringify(payload || {}),
       signal: ac.signal,
     });
+    clearTimeout(killTimer);
   } catch (e) {
+    clearTimeout(killTimer);
     return send(res, 502, { error: `upstream fetch failed: ${e.message}` });
   }
 
@@ -192,9 +199,12 @@ function readFileTool(args) {
   return new Promise((resolve) => {
     fs.readFile(file, 'utf8', (err, data) => {
       if (err) return resolve({ ok: false, error: err.message, path: file });
-      const max = 48 * 1024;
-      const body = data.length > max ? data.slice(0, max) + `\n… [файл обрезан, всего ${data.length} символов]` : data;
-      resolve({ ok: true, path: file, content: body });
+      const offset = Math.max(0, Number(args.offset) || 0);
+      const max = Math.min(96 * 1024, Math.max(1024, Number(args.length) || 48 * 1024));
+      const rest = offset > 0 ? data.slice(offset) : data;
+      const truncated = rest.length > max;
+      const body = truncated ? rest.slice(0, max) + `\n… [показано ${max} из ${rest.length} символов; дальше читайте с offset=${offset + max}]` : rest;
+      resolve({ ok: true, path: file, total: data.length, offset, content: body, truncated });
     });
   });
 }
@@ -211,6 +221,52 @@ function writeFileTool(args) {
       });
     });
   });
+}
+
+/* ---------- вложения: чанковая загрузка любых размеров ---------- */
+const uploads = new Map(); // id -> { fp, name, size, written }
+
+function safeName(n) {
+  const base = path.basename(String(n || 'file'));
+  const cleaned = base.replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 120).trim();
+  return cleaned || 'file';
+}
+
+function uniquePath(dir, name) {
+  let final = path.join(dir, name);
+  let i = 1;
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  while (fs.existsSync(final)) {
+    final = path.join(dir, `${stem}-${i++}${ext}`);
+  }
+  return final;
+}
+
+async function handleUploadInit(req, res) {
+  let b;
+  try { b = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'bad json' }); }
+  const name = safeName(b.name);
+  const dir = path.join(WORKSPACE, 'zx-files');
+  try { await fs.promises.mkdir(dir, { recursive: true }); } catch (e) { return send(res, 500, { error: e.message }); }
+  const fp = uniquePath(dir, name);
+  const id = require('crypto').randomBytes(12).toString('hex');
+  uploads.set(id, { fp, name, size: Number(b.size) || 0, written: 0 });
+  send(res, 200, { ok: true, id, path: fp });
+}
+
+async function handleUploadChunk(req, res, query) {
+  const up = uploads.get(query.get('id'));
+  if (!up) return send(res, 404, { error: 'загрузка не найдена' });
+  let buf;
+  try { buf = await readBodyRaw(req, 16 * 1024 * 1024); } catch (e) { return send(res, 400, { error: e.message }); }
+  try {
+    await fs.promises.appendFile(up.fp, buf);
+  } catch (e) { return send(res, 500, { error: e.message }); }
+  up.written += buf.length;
+  const done = up.written >= up.size;
+  if (done) uploads.delete(query.get('id'));
+  send(res, 200, { ok: true, written: up.written, done, path: up.fp });
 }
 
 const TOOLS = {
@@ -332,6 +388,14 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/tools/exec' && req.method === 'POST') {
       return await handleToolExec(req, res);
+    }
+
+    if (u.pathname === '/api/upload/init' && req.method === 'POST') {
+      return await handleUploadInit(req, res);
+    }
+
+    if (u.pathname === '/api/upload/chunk' && req.method === 'PUT') {
+      return await handleUploadChunk(req, res, u.searchParams);
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {

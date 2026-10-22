@@ -498,3 +498,31 @@ details.think .think-body { padding: 2px 14px 10px; white-space: pre-wrap; line-
 .ws-input:focus { border-color: var(--accent); }
 .composer-hint { cursor: pointer; }
 .composer-hint:hover { color: var(--text-2); }
+
+
+/* ---------- Вложения ---------- */
+.attach-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 18px 0; }
+.attach-row.in-msg { padding: 8px 0 0; }
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 240px;
+  background: #F5F3EB; border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 4px 9px;
+  font-size: 12px; line-height: 1.3;
+}
+.msg-user .attach-chip { background: #FFFFFF66; border-color: #E0DCCE; }
+.attach-chip .att-ico { flex-shrink: 0; }
+.attach-chip .att-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+.attach-chip .att-size { color: var(--text-3); flex-shrink: 0; font-size: 11px; }
+.attach-chip .att-del {
+  flex-shrink: 0; width: 16px; height: 16px;
+  border-radius: 4px; color: var(--text-3);
+  font-size: 11px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+.attach-chip .att-del:hover { background: #E5E1D2; color: var(--err); }
+.attach-chip.load { opacity: .65; }
+.attach-chip.err { border-color: #E8CFC5; color: var(--err); }
+.composer.drag { border-color: var(--accent); background: #FDF8F4; }
+.tag.local { color: #3E7A57; background: #E4F1E9; }

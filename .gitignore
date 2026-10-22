@@ -5,3 +5,5 @@ node_modules/
 nohup.out
 .DS_Store
 zx.config.json
+zx-files/
+zx-context.json

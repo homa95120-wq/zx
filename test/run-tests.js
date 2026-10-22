@@ -133,6 +133,20 @@ async function main() {
   // вернём исходную папку
   await req('POST', '/api/agent/workspace', JSON.stringify({ path: WS_DIR }), { 'content-type': 'application/json' });
 
+
+  // 4d. вложения: чанковая загрузка любых размеров
+  const initUp = JSON.parse((await req('POST', '/api/upload/init', JSON.stringify({ name: 'big-data.bin', size: 10 }), { 'content-type': 'application/json' })).body);
+  check('upload/init: путь в zx-files', initUp.ok === true && initUp.path.includes('zx-files'), initUp.path);
+  await req('PUT', '/api/upload/chunk?id=' + initUp.id, 'AAAAA', { 'content-type': 'application/octet-stream' });
+  const up2 = await req('PUT', '/api/upload/chunk?id=' + initUp.id, 'BBBBB', { 'content-type': 'application/octet-stream' });
+  check('upload/chunk: файл собран', up2.status === 200 && JSON.parse(up2.body).done === true);
+  const rf2 = await exec({ tool: 'read_file', args: { path: initUp.path } });
+  check('агент видит загруженный файл', JSON.parse(rf2.body).content === 'AAAAABBBBB');
+  const rf3 = await exec({ tool: 'read_file', args: { path: initUp.path, offset: 5 } });
+  check('read_file: чтение с offset', JSON.parse(rf3.body).content.startsWith('BBBBB'));
+  const evilUp = JSON.parse((await req('POST', '/api/upload/init', JSON.stringify({ name: '../../evil.txt', size: 1 }), { 'content-type': 'application/json' })).body);
+  check('upload: traversal нейтрализован', !evilUp.path.includes('..'), evilUp.path);
+
   // 5. защита от левых url
   const evil = await req('POST', '/api/proxy', JSON.stringify({ url: 'ftp://evil', payload: {} }), { 'content-type': 'application/json' });
   check('недопустимый url отклонён', evil.status === 400);

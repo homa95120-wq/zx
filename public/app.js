@@ -10,7 +10,7 @@
    ============================================================ */
 
 const $ = (s) => document.querySelector(s);
-const LS = { chats: 'zx.chats', keys: 'zx.keys', settings: 'zx.settings', models: 'zx.models' };
+const LS = { chats: 'zx.chats', keys: 'zx.keys', settings: 'zx.settings', models: 'zx.models', limits: 'zx.limits' };
 
 /* ---------------- состояние ---------------- */
 let CAT = { providers: [], priority: [] };
@@ -25,8 +25,22 @@ let settings = {
   agent: { enabled: true, ask: true },
 };
 let modelsCache = {};
+let limits = {};            // { pid: { until, reason } } — дневные лимиты провайдеров
 let streaming = null;
 let sessionAllowAll = false;
+
+/* ---------- вложения ---------- */
+let attachments = [];       // {name,size,path,text?,status:'load'|'ok'|'err'}
+const INLINE_BUDGET = 250 * 1024;
+let inlineUsed = 0;
+const TEXTY = /\.(txt|md|markdown|json|jsonc|js|mjs|cjs|ts|tsx|jsx|css|html|htm|xml|yml|yaml|csv|tsv|log|py|rb|go|rs|java|kt|c|cpp|h|hpp|cs|php|sh|bash|bat|ps1|sql|ini|toml|conf|env|gitignore|dockerfile|r|swift|vue|svelte)$/i;
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' Б';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' КБ';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' МБ';
+  return (n / 1073741824).toFixed(2) + ' ГБ';
+}
 
 const CUSTOM_PROVIDER = () => ({
   id: 'custom',
@@ -65,10 +79,14 @@ const TOOLS_SCHEMA = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Прочитать текстовый файл с диска пользователя.',
+      description: 'Прочитать текстовый файл с диска пользователя. Большие файлы читайте кусками: offset (начало в символах) + length.',
       parameters: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'путь к файлу (относительный рабочей папки или абсолютный)' } },
+        properties: {
+          path: { type: 'string', description: 'путь к файлу (относительный рабочей папки или абсолютный)' },
+          offset: { type: 'number', description: 'смещение в символах (для чтения больших файлов кусками)' },
+          length: { type: 'number', description: 'сколько символов читать за раз (по умолчанию 48К)' },
+        },
         required: ['path'],
       },
     },
@@ -308,7 +326,11 @@ function renderSidebar() {
 
 function msgHtml(m, i) {
   if (m.role === 'user') {
-    return `<div class="msg-user" data-i="${i}"><div class="bubble">${esc(m.content)}</div></div>`;
+    const chips = (m.attachments || []).length
+      ? `<div class="attach-row in-msg">${m.attachments.map((a) =>
+          `<span class="attach-chip ok" title="${esc(a.path || a.name)}"><span class="att-ico">📄</span><span class="att-name">${esc(a.name)}</span><span class="att-size">${fmtSize(a.size)}</span></span>`).join('')}</div>`
+      : '';
+    return `<div class="msg-user" data-i="${i}"><div class="bubble">${esc(m.content)}${chips}</div></div>`;
   }
   const actions = `
     <div class="meta-row">
@@ -374,11 +396,13 @@ function scrollBottom(force = false) {
 }
 
 function renderProvStatus() {
-  const freeReady = CAT.providers.filter((p) => !p.paid && (p.keyless || keys[p.id])).length;
+  const freeReady = CAT.providers.filter((p) => !p.paid && !p.local && (p.keyless || keys[p.id])).length;
+  const localReady = CAT.providers.filter((p) => p.local && (modelsCache[p.id]?.list || []).length).length;
   const paidReady = CAT.providers.filter((p) => p.paid && keys[p.id]).length;
   const customReady = settings.custom.url && settings.custom.model ? 1 : 0;
   const el = $('#provStatus');
-  el.innerHTML = `<span class="dot ${freeReady ? 'ok' : ''}"></span> бесплатно: ${freeReady}` +
+  el.innerHTML = `<span class="dot ${freeReady || localReady ? 'ok' : ''}"></span> бесплатно: ${freeReady}` +
+    (localReady ? ` · локальных: ${localReady}` : '') +
     (paidReady ? ` · топ: ${paidReady}` : '') + (customReady ? ' + свой' : '');
 }
 
@@ -418,7 +442,99 @@ input.addEventListener('keydown', (e) => {
 });
 $('#sendBtn').addEventListener('click', () => (streaming ? stopStreaming() : sendMessage()));
 $('#newChatBtn').addEventListener('click', () => newChat());
-$('#plusBtn').addEventListener('click', () => toast('Вложения файлов — скоро'));
+$('#plusBtn').addEventListener('click', () => $('#fileInput').click());
+$('#fileInput').addEventListener('change', (e) => { attachFiles([...(e.target.files || [])]); e.target.value = ''; });
+
+function blobToText(b) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result || ''));
+    r.onerror = rej;
+    r.readAsText(b);
+  });
+}
+function blobToBuf(b) {
+  return new Promise((res, rej) => {
+    if (b.arrayBuffer) return b.arrayBuffer().then(res, rej);
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = rej;
+    r.readAsArrayBuffer(b);
+  });
+}
+
+async function uploadFile(file) {
+  const init = await (await fetch('/api/upload/init', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: file.name, size: file.size }),
+  })).json();
+  if (!init.ok) throw new Error(init.error || 'сервер не принял файл');
+  const CH = 4 * 1024 * 1024;
+  for (let off = 0; off < file.size; off += CH) {
+    const buf = await blobToBuf(file.slice(off, off + CH));
+    const r = await fetch('/api/upload/chunk?id=' + encodeURIComponent(init.id), {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: buf,
+    });
+    if (!r.ok) throw new Error('чанк не принят сервером');
+  }
+  return init.path;
+}
+
+async function attachFiles(files) {
+  for (const f of files) {
+    if (f.size > 4 * 1024 ** 3) { toast(`${f.name}: файл больше 4 ГБ — не потянет браузер`, true); continue; }
+    const chip = { name: f.name, size: f.size, path: '', status: 'load' };
+    attachments.push(chip);
+    renderAttach();
+    try {
+      chip.path = await uploadFile(f);
+      if (f.size <= 200 * 1024 && (TEXTY.test(f.name) || (f.type || '').startsWith('text/'))) {
+        const text = await blobToText(f);
+        if (inlineUsed + text.length <= INLINE_BUDGET) { chip.text = text; inlineUsed += text.length; }
+      }
+      chip.status = 'ok';
+    } catch (e) {
+      chip.status = 'err';
+      chip.error = e.message;
+      toast(`${f.name}: ${e.message}`, true);
+    }
+    renderAttach();
+  }
+  updateSendBtn();
+}
+
+function renderAttach() {
+  const row = $('#attachRow');
+  if (!attachments.length) { row.hidden = true; row.innerHTML = ''; return; }
+  row.hidden = false;
+  row.innerHTML = attachments.map((a, i) => `
+    <span class="attach-chip ${a.status}" title="${esc(a.path || a.name)}${a.error ? ' — ' + esc(a.error) : ''}">
+      <span class="att-ico">${a.status === 'err' ? '⚠' : '📄'}</span>
+      <span class="att-name">${esc(a.name)}</span>
+      <span class="att-size">${a.status === 'load' ? 'загрузка…' : fmtSize(a.size)}</span>
+      <button class="att-del" data-i="${i}" title="Убрать">✕</button>
+    </span>`).join('');
+  row.querySelectorAll('.att-del').forEach((b) => b.addEventListener('click', () => {
+    const a = attachments[Number(b.dataset.i)];
+    if (a?.text) inlineUsed = Math.max(0, inlineUsed - a.text.length);
+    attachments.splice(Number(b.dataset.i), 1);
+    renderAttach();
+    updateSendBtn();
+  }));
+}
+
+// drag & drop на композер
+const composerEl = $('#composer');
+composerEl.addEventListener('dragover', (e) => { e.preventDefault(); composerEl.classList.add('drag'); });
+composerEl.addEventListener('dragleave', () => composerEl.classList.remove('drag'));
+composerEl.addEventListener('drop', (e) => {
+  e.preventDefault();
+  composerEl.classList.remove('drag');
+  if (e.dataTransfer?.files?.length) attachFiles([...e.dataTransfer.files]);
+});
 $('#agentBtn').addEventListener('click', () => {
   settings.agent = settings.agent || { enabled: true, ask: true };
   settings.agent.enabled = !settings.agent.enabled;
@@ -426,6 +542,17 @@ $('#agentBtn').addEventListener('click', () => {
   renderAgentChip();
   toast(settings.agent.enabled ? 'Агент включён: могу выполнять команды и править файлы' : 'Агент выключен: обычный чат');
 });
+
+/* ---------------- память дневных лимитов ---------------- */
+function nextMidnight() { const d = new Date(); d.setHours(24, 0, 0, 0); return d.getTime(); }
+
+function markLimit(pid, detail) {
+  const daily = /daily|per day|per-day|\bday\b|день|сутк|месяц|month|quota/i.test(String(detail || ''));
+  limits[pid] = { until: daily ? nextMidnight() : Date.now() + 60 * 60 * 1000, reason: String(detail || '').slice(0, 140) };
+  save(LS.limits, limits);
+}
+
+function limitActive(pid) { return (limits[pid]?.until || 0) > Date.now(); }
 
 /* ---------------- подтверждение действий ---------------- */
 function approvalDetail(call) {
@@ -497,10 +624,12 @@ async function fetchModels(p) {
   const key = p.custom ? settings.custom.key : (keys[p.id] || '');
   const url = p.baseUrl + '/models';
   let list = null;
-  try {
-    const res = await fetch(url, { headers: authHeaders(p, key) });
-    if (res.ok) list = (await res.json())?.data?.map((m) => String(m.id).replace(/^models\//, '')) || null;
-  } catch { /* CORS/сеть — пробуем через сервер */ }
+  if (!p.local) {
+    try {
+      const res = await fetch(url, { headers: authHeaders(p, key) });
+      if (res.ok) list = (await res.json())?.data?.map((m) => String(m.id).replace(/^models\//, '')) || null;
+    } catch { /* CORS/сеть — пробуем через сервер */ }
+  }
   if (!list) {
     try {
       const res = await fetch('/api/proxy', {
@@ -543,11 +672,13 @@ function buildChain() {
     const p = byId(sel.provider);
     if (p) chain.unshift({ provider: p, model: sel.model, key: p.custom ? settings.custom.key : (keys[p.id] || '') });
   }
-  // автоматом перебираем только бесплатные
+  // автоматом перебираем только бесплатные (+ локальные, если запущены)
   for (const pid of CAT.priority || []) {
     const p = byId(pid);
     if (!p || p.paid) continue;
     if (!p.keyless && !keys[p.id]) continue;
+    if (p.local && !(modelsCache[p.id]?.list || []).length) continue; // Ollama/LM Studio не запущены
+    if (limitActive(p.id)) continue; // у провайдера дневной лимит — вернёмся к нему завтра
     const model = pickModel(p);
     if (model) chain.push({ provider: p, model, key: keys[p.id] || '' });
   }
@@ -692,17 +823,43 @@ function buildMessages(history) {
   const msgs = [];
   const sys = [(settings.system || '').trim(), agentSystem()].filter(Boolean).join('\n\n');
   if (sys) msgs.push({ role: 'system', content: sys });
-  msgs.push(...history.slice(-30).map((m) => ({ role: m.role, content: m.content })));
+  msgs.push(...history.slice(-30).map((m) => ({
+    role: m.role,
+    content: m.content + (m.inline ? '\n' + m.inline : ''),
+  })));
+  // большие проекты: сжимаем старые сообщения, свежие остаются целиком
+  const BUDGET = 60000;
+  let total = msgs.reduce((a, m) => a + (m.content || '').length, 0);
+  for (let i = 1; i < msgs.length - 6 && total > BUDGET; i++) {
+    const c = msgs[i].content || '';
+    if (c.length > 500) {
+      total -= c.length - 500;
+      msgs[i].content = c.slice(0, 500) + ' …[сокращено для экономии контекста]';
+    }
+  }
   return msgs;
 }
 
 async function sendMessage() {
   const text = input.value.trim();
   if (!text || streaming) return;
+  if (attachments.some((a) => a.status === 'load')) { toast('Файлы ещё загружаются…', true); return; }
   let c = curChat();
   if (!c) { newChat(true); c = curChat(); }
 
-  c.messages.push({ role: 'user', content: text });
+  const att = attachments.filter((a) => a.status === 'ok');
+  const inline = att.filter((a) => a.text)
+    .map((a) => `\n\n--- Файл: ${a.name} (${fmtSize(a.size)}) ---\n${a.text}`)
+    .join('');
+  const msg = { role: 'user', content: text };
+  if (att.length) {
+    msg.attachments = att.map(({ name, size, path }) => ({ name, size, path }));
+    const manifest = '\n\n[Вложенные файлы доступны агенту по этим путям:]\n' +
+      att.map((a) => `- ${a.path}`).join('\n');
+    msg.inline = (manifest + inline);
+  }
+  attachments = []; inlineUsed = 0; renderAttach();
+  c.messages.push(msg);
   if (c.title === 'Новый чат') c.title = text.slice(0, 46) + (text.length > 46 ? '…' : '');
   input.value = ''; autosize(); updateSendBtn();
   $('#main').classList.remove('centered');
@@ -852,7 +1009,9 @@ async function runCompletion(c) {
           m.error = `<b>Провайдер оборвал поток.</b> ${esc(e.detail || '')}`;
           break;
         }
-        m.failovers.push({ provider: target.provider.name, reason: reasonLabel(e.status || 0, e.detail) });
+        const reason = reasonLabel(e.status || 0, e.detail);
+        m.failovers.push({ provider: target.provider.name, reason });
+        if (reason === 'лимит') markLimit(target.provider.id, e.detail);
         if (e.detail) console.warn('zx failover:', target.provider.id, e.status, e.detail);
         break; // к следующему провайдеру цепочки
       }
@@ -935,8 +1094,13 @@ function buildMenuDom() {
       const hasKey = p.keyless || (p.custom ? !!settings.custom.url : !!keys[p.id]);
       const sec = document.createElement('div');
       sec.className = 'menu-section';
-      const tag = p.paid ? '<span class="tag paid">по ключу · платно</span>' : `<span class="tag">${esc(p.free)}</span>`;
-      sec.innerHTML = `<span>${esc(p.name)}</span>${tag}${hasKey ? '' : '<span style="text-transform:none;letter-spacing:0">· нужен ключ</span>'}`;
+      const tag = p.paid
+        ? '<span class="tag paid">по ключу · платно</span>'
+        : (p.local ? '<span class="tag local">∞ токенов · локально</span>' : `<span class="tag">${esc(p.free)}</span>`);
+      const lim = limitActive(p.id)
+        ? `<span style="text-transform:none;letter-spacing:0">· лимит до ${new Date(limits[p.id].until).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}</span>`
+        : '';
+      sec.innerHTML = `<span>${esc(p.name)}</span>${tag}${hasKey ? lim : '<span style="text-transform:none;letter-spacing:0">· нужен ключ</span>'}`;
       menu.appendChild(sec);
 
       const list0 = modelsCache[p.id]?.list || [];
@@ -945,7 +1109,9 @@ function buildMenuDom() {
       if (!shown.length) {
         const hint = document.createElement('div');
         hint.className = 'menu-foot';
-        hint.textContent = hasKey ? 'Список моделей загрузится…' : 'Добавьте ключ в Настройках, чтобы включить провайдера';
+        hint.textContent = p.local
+          ? (p.id === 'ollama' ? 'Ollama не запущена — установите с ollama.com и выполните «ollama pull qwen3»' : 'Запустите LM Studio и включите локальный сервер')
+          : (hasKey ? 'Список моделей загрузится…' : 'Добавьте ключ в Настройках, чтобы включить провайдера');
         menu.appendChild(hint);
         continue;
       }
@@ -979,7 +1145,7 @@ function buildMenuDom() {
 
   const foot = document.createElement('div');
   foot.className = 'menu-foot';
-  foot.textContent = '«Авто» перебирает бесплатные: Google → Groq → Cerebras → Mistral → OpenRouter → NVIDIA → OVH. Claude и GPT — по явному выбору, тарифицируются вашим ключом.';
+  foot.textContent = '«Авто» выжимает бесплатные лимиты: Google → Groq → Cerebras → Mistral → OpenRouter → NVIDIA → OVH → локальные Ollama/LM Studio (∞). При дневном лимите провайдер пропускается до завтра. Claude и GPT — по вашему ключу.';
   menu.appendChild(foot);
 }
 
@@ -1164,6 +1330,7 @@ async function boot() {
   settings.custom = Object.assign({ url: '', key: '', model: '' }, settings.custom || {});
   settings.agent = Object.assign({ enabled: true, ask: true }, settings.agent || {});
   modelsCache = load(LS.models, {}) || {};
+  limits = load(LS.limits, {}) || {};
 
   try {
     const [r, w] = await Promise.all([fetch('/api/providers'), fetch('/api/agent/info')]);
@@ -1187,6 +1354,10 @@ async function boot() {
   renderAll();
   autosize();
   updateSendBtn();
+  // локальные модели: тихо проверяем, запущены ли Ollama / LM Studio
+  for (const p of CAT.providers.filter((x) => x.local)) {
+    fetchModels(p).then((list) => { if (list.length) { renderProvStatus(); toast(`Локальные модели найдены: ${p.name}`, false, 2200); } }).catch(() => {});
+  }
   if (window.innerWidth > 760) input.focus();
 }
 

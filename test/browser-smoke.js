@@ -47,6 +47,8 @@ async function main() {
   const jsonResp = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'content-type': 'application/json' } });
 
   let chatCalls = 0;
+  let lastChatBody = '';
+  let force429 = false;
 
   const dom = await JSDOM.fromFile(path.join(__dirname, '..', 'public', 'index.html'), {
     url: BASE + '/',
@@ -59,12 +61,19 @@ async function main() {
       window.localStorage.setItem('zx.keys', JSON.stringify({ groq: 'test-key' }));
       window.fetch = (input, init) => {
         const url = String(input instanceof Object ? input.url : input);
+        if (url.startsWith('/api/proxy') && typeof init?.body === 'string' && init.body.includes('ovh')) {
+          return Promise.resolve(new Response(JSON.stringify({ error: 'upstream blocked in test' }), { status: 502, headers: { 'content-type': 'application/json' } }));
+        }
         if (url.startsWith('/')) return realFetch(BASE + url, init);
         if (url.includes('api.groq.com')) {
           if (url.endsWith('/models')) {
             return Promise.resolve(jsonResp({ data: [{ id: 'mock-120b' }, { id: 'mock-embed-x' }, { id: 'llama-70b' }] }));
           }
           chatCalls++;
+          if (typeof init?.body === 'string') lastChatBody = init.body;
+          if (force429) {
+            return Promise.resolve(new Response(JSON.stringify({ error: { message: 'rate limit: daily quota exceeded, try tomorrow' } }), { status: 429, headers: { 'content-type': 'application/json' } }));
+          }
           if (chatCalls === 1) {
             // первый заход: модель вызывает инструмент
             return Promise.resolve(sse([
@@ -130,6 +139,33 @@ async function main() {
     body: JSON.stringify({ tool: 'write_file', args: { path: 'smoke.txt', content: 'ok' } }),
   });
   check('сервер исполняет write_file в workspace', execRes.ok && fs.existsSync(path.join(WS_DIR, 'smoke.txt')));
+
+  // ---- вложения файлов ----
+  const file = new window.File(['строка-1\nстрока-2'], 'note.txt', { type: 'text/plain' });
+  const fi = doc.querySelector('#fileInput');
+  Object.defineProperty(fi, 'files', { value: [file], configurable: true });
+  fi.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await sleep(900);
+  check('чип вложения появился', [...doc.querySelectorAll('#attachRow .attach-chip')].some((e) => e.textContent.includes('note.txt')));
+  check('файл загружен в zx-files', fs.existsSync(path.join(WS_DIR, 'zx-files', 'note.txt')));
+
+  input.value = 'Что внутри приложенного файла?';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  doc.querySelector('#sendBtn').click();
+  await sleep(900);
+  check('чип вложения в сообщении', [...doc.querySelectorAll('.msg-user .attach-chip')].some((e) => e.textContent.includes('note.txt')));
+  check('мелкий текст авто-вшит в контекст модели', lastChatBody.includes('Файл: note.txt') && lastChatBody.includes('строка-2'));
+
+  // ---- дневной лимит: запоминается и провайдер обходится ----
+  force429 = true;
+  input.value = 'Ещё один вопрос';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  doc.querySelector('#sendBtn').click();
+  await sleep(1500);
+  const lim = JSON.parse(window.localStorage.getItem('zx.limits') || '{}');
+  check('дневной лимит Groq запомнен', (lim.groq?.until || 0) > Date.now(), JSON.stringify(lim));
+  check('бейдж показывает обход', [...doc.querySelectorAll('.msg-badge')].some((e) => e.textContent.includes('↻')));
+  check('агент объяснил исчерпание лимитов', [...doc.querySelectorAll('.error-card')].some((e) => e.textContent.includes('Никто из цепочки')));
 
   // смена рабочей папки через UI
   doc.querySelector('#wsBtn').click();
