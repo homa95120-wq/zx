@@ -416,7 +416,8 @@ function toolCardHtml(st) {
   }
   const status = st.pending ? '⏳'
     : (st.denied ? '✕ отклонено'
-      : (st.ok ? '✓' : '✗' + (st.result?.exitCode != null ? ' код ' + st.result.exitCode : '')));
+      : (st.aborted ? '✕ прервано'
+        : (st.ok ? '✓' : '✗' + (st.result?.exitCode != null ? ' код ' + st.result.exitCode : ''))));
   return `<div class="tool-card ${st.ok === false && !st.pending && !st.denied ? 'tool-err' : ''}">` +
     `<div class="tool-head"><span class="tool-ico">⚙</span><b>${esc(label)}</b>` +
     `<span class="tool-args">${esc(short.length > 110 ? short.slice(0, 110) + '…' : short)}</span>` +
@@ -898,9 +899,8 @@ async function upstreamChat(target, payload, signal) {
   });
   const wrapped = wrapRes(res, true);
   if (res.status === 502) {
-    let detail = '';
-    try { detail = (await res.json())?.error || ''; } catch {}
-    throw { failover: true, status: 0, detail: detail || 'сервер недоступен' };
+    const detail = await upstreamErrorDetail(res);
+    throw { failover: true, status: 502, detail: detail || 'сервер недоступен' };
   }
   return wrapped;
 }
@@ -930,6 +930,21 @@ function wrapRes(res, isProxy) {
   };
 }
 
+/* Причина ошибки провайдера: все типовые JSON-форматы (error.message / message /
+   detail / string-error), а если ответ не JSON (HTML-страница провайдера) —
+   первые ~200 символов очищенного текста, без простыней разметки. */
+async function upstreamErrorDetail(res) {
+  let t = '';
+  try { t = String((await res.text()) || ''); } catch { return ''; }
+  try {
+    const j = JSON.parse(t);
+    const d = j?.error?.message || j?.message || (typeof j?.detail === 'string' ? j.detail : '')
+      || (typeof j?.error === 'string' ? j.error : '') || '';
+    if (d) return String(d).slice(0, 300);
+  } catch {}
+  return t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
 async function streamTarget(target, messages, handlers, signal, withTools) {
   const payload = { model: target.model, messages, stream: true };
   if (withTools) payload.tools = TOOLS_SCHEMA;
@@ -937,11 +952,7 @@ async function streamTarget(target, messages, handlers, signal, withTools) {
   if (signal?.aborted) throw { aborted: true };
 
   if (!res.ok) {
-    let detail = '';
-    try {
-      const j = await res.json();
-      detail = j?.error?.message || j?.message || (typeof j?.error === 'string' ? j.error : '') || '';
-    } catch {}
+    const detail = await upstreamErrorDetail(res);
     throw { failover: true, status: res.status, detail };
   }
 
@@ -1059,6 +1070,17 @@ async function regenerate() {
   await runCompletion(c);
 }
 
+/* Пауза, которая не спит дольше отмены: снимается сигналом текущего стрима */
+function waitAbort(ms) {
+  return new Promise((resolve) => {
+    const s = streaming?.abort?.signal;
+    if (!s || s.aborted) return resolve();
+    const done = () => { clearTimeout(t); s.removeEventListener('abort', done); resolve(); };
+    const t = setTimeout(done, ms);
+    s.addEventListener('abort', done, { once: true });
+  });
+}
+
 async function runCompletion(c) {
   const chain = buildChain();
   const m = { role: 'assistant', content: '', think: '', provider: '', model: '', failovers: [], ms: 0, steps: [] };
@@ -1095,107 +1117,159 @@ async function runCompletion(c) {
   const agentOn = () => !!settings.agent?.enabled;
   const baseHistory = buildMessages(c.messages.slice(0, -1));
   const MAX_ITER = 15;
+  // Общая API-история на всю цепочку провайдеров: при фейловере к следующему
+  // провайдеру передаём её целиком — выполненные шаги (m.steps) не теряются
+  // и не выполняются повторно.
+  let apiMessages = baseHistory.slice();
 
   for (const target of chain) {
     if (streaming.stopped) break;
     let started = false;
-    let apiMessages = baseHistory.slice();
     let noTools = false; // провайдер не потянул tools — повторяем без них
     let ok = false;
 
     for (let iter = 0; iter < MAX_ITER; iter++) {
       if (streaming.stopped) break;
       const pending = new Map(); // index -> {id, name, argsStr}
+      let iterStarted = false;   // дельты пришли именно в этом HTTP-запросе
+      let iterContent = '';      // текст ТОЛЬКО текущей итерации
+      let iterRetry = 0;         // коротких ретраев уже сделано на этом шаге
+      let nextIter = false;      // tool_calls выполнены — следующий шаг
+      let failover = false;      // ошибка до потока — к следующему провайдеру
 
-      try {
-        await streamTarget(
-          target,
-          apiMessages,
-          {
-            onDelta: (d) => {
-              if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
-              m.content += (m.content ? '' : '') + d;
-              rerender();
+      attemptLoop:
+      while (true) {
+        try {
+          await streamTarget(
+            target,
+            apiMessages,
+            {
+              onDelta: (d) => {
+                if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
+                iterStarted = true;
+                // текст разных шагов разделяем переносом строки
+                if (iterContent === '' && m.content !== '') m.content += '\n\n';
+                m.content += d;
+                iterContent += d;
+                rerender();
+              },
+              onThink: (d) => { m.think = (m.think || '') + d; iterStarted = true; rerender(); },
+              onToolCall: (tc) => {
+                if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
+                iterStarted = true;
+                // Часть провайдеров (OVH, vLLM, Qwen3 и др.) стримит чанки одного
+                // tool_call БЕЗ поля index: тогда аргументы дописываем в последний
+                // открытый вызов (совпал id — там же; ни id, ни нового name — там же).
+                // Новый слот открываем только при новых id или function.name.
+                const lastIdx = pending.size - 1;
+                const last = lastIdx >= 0 ? pending.get(lastIdx) : null;
+                let idx;
+                if (typeof tc.index === 'number') idx = tc.index;
+                else if (last && (tc.id ? tc.id === last.id : !tc.function?.name)) idx = lastIdx;
+                else idx = pending.size;
+                const cur = pending.get(idx) || { id: tc.id || '', name: '', argsStr: '' };
+                if (tc.id) cur.id = tc.id;
+                if (tc.function?.name) cur.name = tc.function.name;
+                if (typeof tc.function?.arguments === 'string') cur.argsStr += tc.function.arguments;
+                else if (tc.function?.arguments && typeof tc.function.arguments === 'object') cur.argsStr = JSON.stringify(tc.function.arguments);
+                pending.set(idx, cur);
+              },
+              hasToolCalls: () => pending.size > 0,
             },
-            onThink: (d) => { m.think = (m.think || '') + d; rerender(); },
-            onToolCall: (tc) => {
-              if (!started) { started = true; m.provider = target.provider.name; m.model = target.model; }
-              const idx = typeof tc.index === 'number' ? tc.index : pending.size;
-              const cur = pending.get(idx) || { id: tc.id || '', name: '', argsStr: '' };
-              if (tc.id) cur.id = tc.id;
-              if (tc.function?.name) cur.name = tc.function.name;
-              if (typeof tc.function?.arguments === 'string') cur.argsStr += tc.function.arguments;
-              else if (tc.function?.arguments && typeof tc.function.arguments === 'object') cur.argsStr = JSON.stringify(tc.function.arguments);
-              pending.set(idx, cur);
-            },
-            hasToolCalls: () => pending.size > 0,
-          },
-          streaming.abort.signal,
-          agentOn() && !noTools
-        );
+            streaming.abort.signal,
+            agentOn() && !noTools
+          );
 
-        // == поток завершился ==
-        const calls = [...pending.values()].filter((x) => x.name);
-        if (agentOn() && calls.length) {
-          // фиксируем ответ ассистента с tool_calls в API-истории
-          apiMessages.push({
-            role: 'assistant',
-            content: m.content || '',
-            tool_calls: calls.map((x, i) => ({
+          // == поток завершился ==
+          const calls = [...pending.values()].filter((x) => x.name);
+          if (agentOn() && calls.length) {
+            // Массив tool_calls храним в локальной переменной: как только в
+            // apiMessages пойдёт первый { role: 'tool' }, «последнее сообщение»
+            // перестанет быть assistant-сообщением (на этом в i≥1 параллельных
+            // вызовов и падал TypeError).
+            const toolCallsMsg = calls.map((x, i) => ({
               id: x.id || `call_${iter}_${i}`,
               type: 'function',
               function: { name: x.name, arguments: x.argsStr || '{}' },
-            })),
-          });
-
-          for (const [i, call] of calls.entries()) {
-            let args = {};
-            try { args = JSON.parse(call.argsStr || '{}'); } catch { args = { _raw: call.argsStr }; }
-            const st = { tool: call.name, args, pending: true };
-            m.steps.push(st);
-            rerender();
-            const id = apiMessages[apiMessages.length - 1].tool_calls[i].id;
-            const { denied, result } = await execTool({ ...call, args, provider: target.provider.name });
-            st.pending = false; st.denied = denied; st.result = result; st.ok = !!result.ok;
-            rerender();
-            // web_fetch отдаёт до 48К символов страницы — модели нужен весь кусок,
-            // чтобы работал offset-хинт в конце; media_probe/media_render — до 16 КБ.
-            const toolBudget = call.name === 'web_fetch'
-              ? 50 * 1024
-              : (call.name === 'media_probe' || call.name === 'media_render' ? 16 * 1024 : 8000);
+            }));
             apiMessages.push({
-              role: 'tool',
-              tool_call_id: id,
-              content: JSON.stringify(result).slice(0, toolBudget),
+              role: 'assistant',
+              // в историю — очищенный от ... текст только текущей итерации:
+              // без дублей прошлых рассуждений, которые ломают строгие
+              // OpenAI-совместимые шлюзы
+              content: splitThink(iterContent).body.trim() || null,
+              tool_calls: toolCallsMsg,
             });
-          }
-          continue; // следующий заход: модель видит результаты
-        }
 
-        if (!m.provider) { m.provider = target.provider.name; m.model = target.model; }
-        ok = true;
-        break; // обычный текстовый ответ — готово
-      } catch (e) {
-        if (e && (e.aborted || e.name === 'AbortError' || streaming?.stopped)) {
-          m.stopped = true; break;
+            for (const [i, call] of calls.entries()) {
+              let args;
+              try { args = JSON.parse(call.argsStr || '{}'); } catch { args = { _raw: call.argsStr }; }
+              // "null"/массив от модели не должны ронять approvalDetail и toolCardHtml
+              if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+              const st = { tool: call.name, args, pending: true };
+              m.steps.push(st);
+              rerender();
+              const id = toolCallsMsg[i].id;
+              const { denied, result } = await execTool({ ...call, args, provider: target.provider.name });
+              st.pending = false; st.denied = denied; st.result = result; st.ok = !!result.ok;
+              rerender();
+              // web_fetch отдаёт до 48К символов страницы — модели нужен весь кусок,
+              // чтобы работал offset-хинт в конце; media_probe/media_render — до 16 КБ.
+              const toolBudget = call.name === 'web_fetch'
+                ? 50 * 1024
+                : (call.name === 'media_probe' || call.name === 'media_render' ? 16 * 1024 : 8000);
+              apiMessages.push({
+                role: 'tool',
+                tool_call_id: id,
+                content: JSON.stringify(result).slice(0, toolBudget),
+              });
+            }
+            nextIter = true; // следующий заход: модель видит результаты
+            break attemptLoop;
+          }
+
+          if (!m.provider) { m.provider = target.provider.name; m.model = target.model; }
+          ok = true;
+          break attemptLoop; // обычный текстовый ответ — готово
+        } catch (e) {
+          if (e && (e.aborted || e.name === 'AbortError' || streaming?.stopped)) {
+            m.stopped = true; break attemptLoop;
+          }
+          // провайдер не умеет tools — пробуем ещё раз без них (той же моделью)
+          if (!noTools && agentOn() && (e.status === 400 || e.status === 422) && /tool|function/i.test(e.detail || '')) {
+            noTools = true;
+            apiMessages = baseHistory.slice();
+            m.content = ''; m.steps = [];
+            continue attemptLoop; // тот же шаг, но без tools
+          }
+          if (!iterStarted) {
+            // ошибка 429/5xx/сети ДО начала потока
+            if (m.steps.length > 0 && iterRetry < 1) {
+              // на шаге после выполненных инструментов — один короткий ретрай
+              iterRetry++;
+              await waitAbort(1500);
+              if (streaming.stopped) { m.stopped = true; break attemptLoop; }
+              continue attemptLoop; // тот же провайдер, те же apiMessages
+            }
+            const reason = reasonLabel(e.status || 0, e.detail);
+            m.failovers.push({ provider: target.provider.name, reason });
+            if (reason === 'лимит') markLimit(target.provider.id, e.detail);
+            if (e.detail) console.warn('zx failover:', target.provider.id, e.status, e.detail);
+            failover = true; // к следующему провайдеру с накопленным apiMessages
+            break attemptLoop;
+          }
+          // поток оборвался, когда в этом шаге уже шли дельты — реальный обрыв;
+          // показываем причину (HTTP-код/текст), а не пустое сообщение
+          const detail = e?.detail || e?.message || '';
+          m.error = `<b>Провайдер оборвал поток.</b> ${esc(detail)}`;
+          break attemptLoop;
         }
-        // провайдер не умеет tools — пробуем ещё раз без них (той же моделью)
-        if (!noTools && agentOn() && (e.status === 400 || e.status === 422) && /tool|function/i.test(e.detail || '')) {
-          noTools = true;
-          apiMessages = baseHistory.slice();
-          m.content = ''; m.steps = [];
-          continue;
-        }
-        if (started) {
-          m.error = `<b>Провайдер оборвал поток.</b> ${esc(e.detail || '')}`;
-          break;
-        }
-        const reason = reasonLabel(e.status || 0, e.detail);
-        m.failovers.push({ provider: target.provider.name, reason });
-        if (reason === 'лимит') markLimit(target.provider.id, e.detail);
-        if (e.detail) console.warn('zx failover:', target.provider.id, e.status, e.detail);
-        break; // к следующему провайдеру цепочки
       }
+
+      if (ok || m.stopped || m.error) break;
+      if (!nextIter && !failover) break; // страховка: выхода быть не должно
+      if (failover) break; // к следующему провайдеру цепочки
+      // nextIter → следующая итерация
     }
 
     if (ok || m.stopped || m.error) break;
@@ -1206,10 +1280,17 @@ async function runCompletion(c) {
     const det = m.failovers.length
       ? m.failovers.map((f) => `${esc(f.provider)} — ${f.reason}`).join(', ')
       : 'провайдеры не ответили';
-    m.error = `<b>Никто из цепочки не ответил.</b> ${det}. Проверьте ключи в Настройках или попробуйте ещё раз — лимиты бесплатных тарифов сбрасываются ежедневно.`;
+    const head = m.steps?.length
+      ? '<b>Не удалось дописать ответ</b> (выполненные шаги сохранились выше).'
+      : '<b>Никто из цепочки не ответил.</b>';
+    m.error = `${head} ${det}. Проверьте ключи в Настройках или попробуйте ещё раз — лимиты бесплатных тарифов сбрасываются ежедневно.`;
   }
 
   function finishMsg() {
+    // гарантия: после завершения ответа не остаётся висящего ⏳
+    for (const st of m.steps || []) {
+      if (st.pending) { st.pending = false; st.aborted = true; }
+    }
     m.ms = performance.now() - t0;
     m.badge = badgeFor(m);
     persistChats();
