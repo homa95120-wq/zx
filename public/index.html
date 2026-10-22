@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>zx — ИИ-агент на бесплатных моделях</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23D97757' d='M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <div class="scrim" id="scrim"></div>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z"/></svg>
+      <span class="brand-name">zx</span>
+      <span class="brand-sub">бесплатный агент</span>
+    </div>
+
+    <button class="new-chat" id="newChatBtn">
+      <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
+      Новый чат
+    </button>
+
+    <nav class="chat-list" id="chatList"></nav>
+
+    <div class="sidebar-foot">
+      <div class="prov-status" id="provStatus"></div>
+      <button class="foot-btn" id="openSettingsBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7zm7.4-3.5c0-.6.5-1.1.5-1.7 0-.6-.6-1-1.1-1.5l-1.3-.8c-.2-.6-.5-1.2-.9-1.7l.2-1.5c0-.6-.4-1.1-.9-1.4l-1.3-.4c-.5-.2-1-.4-1.6-.4l-1.2 1c-.6 0-1.2 0-1.8.2l-1.4-.7c-.5-.3-1.1-.2-1.6.1l-1 .9c-.4.4-.8.8-.9 1.4l.4 1.5c-.4.5-.7 1-.9 1.6l-1.4.7c-.5.3-.9.9-.8 1.5l.2 1.4c.1.6.4 1.1.9 1.4l1.5.5c.3.6.6 1.1 1.1 1.6l-.1 1.5c0 .6.3 1.2.8 1.5l1.2.6c.5.3 1.1.3 1.6 0l1.3-.9c.6.1 1.3.1 1.9 0l1.3.9c.5.3 1.1.3 1.6 0l1.2-.6c.5-.3.9-.9.8-1.5l-.1-1.5c.4-.5.8-1 1.1-1.6l1.5-.5c.5-.2 1-.7 1-1.3z"/></svg>
+        Настройки
+      </button>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <button class="icon-btn burger" id="burgerBtn" title="Меню">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <button class="model-pill" id="modelPill">
+        <span class="model-pill-dot" id="modelPillDot"></span>
+        <span id="modelPillLabel">Авто · лучший бесплатный</span>
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M7 10l5 5 5-5"/></svg>
+      </button>
+    </header>
+
+    <div class="thread" id="thread">
+      <div class="empty-state" id="emptyState">
+        <svg class="empty-logo" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z"/></svg>
+        <h1 class="greeting" id="greeting">Доброе утро</h1>
+        <p class="empty-sub">Агент на бесплатных моделях — Gemini, GPT-OSS, DeepSeek, GLM, Qwen и Llama.<br>Сам выбирает доступного провайдера и переключается при лимитах.</p>
+      </div>
+      <div class="messages" id="messages"></div>
+    </div>
+
+    <div class="composer-wrap" id="composerWrap">
+      <div class="composer" id="composer">
+        <textarea id="input" rows="1" placeholder="Спросите что угодно…"></textarea>
+        <div class="composer-bar">
+          <button class="icon-btn" id="plusBtn" title="Вложения — скоро">
+            <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <span class="composer-hint" id="composerHint"></span>
+          <button class="send" id="sendBtn" title="Отправить" disabled>
+            <svg class="ic-send" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>
+            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="disclaimer">Бесплатные тарифы провайдеров · лимиты запросов в день · ключи хранятся только в вашем браузере</p>
+    </div>
+
+    <div class="bottom-spacer" id="bottomSpacer"></div>
+  </main>
+</div>
+
+<div class="menu" id="modelMenu" hidden></div>
+
+<div class="modal-overlay" id="settingsModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Настройки</h2>
+      <button class="icon-btn" id="closeSettingsBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <h3>Провайдеры и ключи</h3>
+      <p class="section-sub">Все ключи бесплатны, карта не нужна. Хранятся только в этом браузере и уходят напрямую выбранному провайдеру.</p>
+      <div id="keyRows"></div>
+
+      <h3>Свой endpoint (OpenAI-совместимый)</h3>
+      <p class="section-sub">Любой другой бесплатный релей — как в freellmapi: укажите URL, ключ и модель.</p>
+      <div class="custom-grid">
+        <input type="text" id="customUrl" placeholder="https://…/v1">
+        <input type="password" id="customKey" placeholder="Ключ (опционально)">
+        <input type="text" id="customModel" placeholder="Модель, напр. glm-5.3:free">
+      </div>
+
+      <h3>Инструкции для агента</h3>
+      <p class="section-sub">Системный промпт — добавляется к каждому чату.</p>
+      <textarea id="systemPrompt" rows="4" placeholder="Напр.: Отвечай кратко, по-русски, с примерами кода."></textarea>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-note">Ничего не отправляется на наш сервер — только выбранному провайдеру.</span>
+      <button class="btn-accent" id="saveSettingsBtn">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
