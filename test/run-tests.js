@@ -4,10 +4,12 @@
 'use strict';
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
 const http = require('http');
 
 const MOCK_PORT = 9101;
 const PORT = 3311;
+const WS_DIR = path.join(os.tmpdir(), 'zx-ws-test');
 
 function req(method, urlPath, body, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -27,7 +29,7 @@ async function main() {
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: '/tmp/zx-ws-test' },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: WS_DIR },
   });
   await new Promise((r) => setTimeout(r, 700));
 
@@ -77,8 +79,8 @@ async function main() {
 
   // 4b. инструменты агента
   const fs = require('fs');
-  fs.rmSync('/tmp/zx-ws-test', { recursive: true, force: true });
-  fs.mkdirSync('/tmp/zx-ws-test', { recursive: true });
+  fs.rmSync(WS_DIR, { recursive: true, force: true });
+  fs.mkdirSync(WS_DIR, { recursive: true });
 
   const exec = async (body) => req('POST', '/api/tools/exec', JSON.stringify(body), { 'content-type': 'application/json' });
 
@@ -100,7 +102,7 @@ async function main() {
   check('неизвестный инструмент отклонён', unk.status === 400);
 
   const info = await req('GET', '/api/agent/info');
-  check('agent/info: workspace', JSON.parse(info.body).workspace === '/tmp/zx-ws-test');
+  check('agent/info: workspace', JSON.parse(info.body).workspace === WS_DIR, JSON.parse(info.body).workspace);
 
   // 5. защита от левых url
   const evil = await req('POST', '/api/proxy', JSON.stringify({ url: 'ftp://evil', payload: {} }), { 'content-type': 'application/json' });

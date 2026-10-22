@@ -5,11 +5,12 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { JSDOM } = require('jsdom');
 
 const PORT = 3312;
 const BASE = `http://127.0.0.1:${PORT}`;
-const WS_DIR = '/tmp/zx-ws-smoke';
+const WS_DIR = path.join(os.tmpdir(), 'zx-ws-smoke');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
