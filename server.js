@@ -223,6 +223,299 @@ function writeFileTool(args) {
   });
 }
 
+/* ---------------- веб: поиск и чтение страниц ---------------- */
+// Бесплатный поиск без ключей через HTML-версию DuckDuckGo + чтение страниц.
+// Всё выполняется на машине пользователя; локальные и приватные адреса
+// запрещены (SSRF), редиректы проверяются на каждом шаге.
+const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const WEB_MAX_BYTES = 2 * 1024 * 1024;
+const WEB_PAGE_CHARS = 48 * 1024;
+
+const HTML_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', shy: '',
+  hellip: '…', mdash: '—', ndash: '–', laquo: '«', raquo: '»', copy: '©', reg: '®', trade: '™',
+  times: '×', divide: '÷', middot: '·', bull: '•', euro: '€', pound: '£', yen: '¥', deg: '°',
+};
+
+function htmlDecode(str) {
+  return String(str).replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);/gi, (m, ent) => {
+    if (ent[0] === '#') {
+      const hex = ent[1] && ent[1].toLowerCase() === 'x';
+      const code = parseInt(ent.slice(hex ? 2 : 1), hex ? 16 : 10);
+      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return m;
+      try { return String.fromCodePoint(code); } catch { return m; }
+    }
+    const v = HTML_ENTITIES[ent.toLowerCase()];
+    return v === undefined ? m : v;
+  });
+}
+
+function htmlToText(html) {
+  let s = String(html);
+  s = s.replace(/<!--[\s\S]*?-->/g, ' ');
+  // скрипты/стили/навигация не нужны в тексте страницы
+  s = s.replace(/<(script|style|noscript|template|svg|canvas|iframe|nav|head)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ');
+  s = s.replace(/<(script|style|noscript|template|svg|canvas|iframe|nav|head)\b[^>]*\/?>/gi, ' ');
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<\/(p|div|section|article|li|tr|h[1-6]|blockquote|pre|table|ul|ol|dl|dd|dt|figure|figcaption)\s*>/gi, '\n');
+  s = s.replace(/<li\b[^>]*>/gi, '\n• ');
+  s = s.replace(/<[^>]+>/g, ' ');
+  s = htmlDecode(s);
+  s = s.replace(/\r\n?/g, '\n');
+  s = s.replace(/[ \t\f\v\u00a0]+/g, ' ');
+  s = s.split('\n').map((line) => line.trim()).join('\n');
+  s = s.replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
+
+function isPrivateHost(rawHost) {
+  let h = String(rawHost || '').trim().toLowerCase();
+  if (!h) return true;
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h.endsWith('.')) h = h.slice(0, -1);
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (/\.(local|internal|intranet|lan|home|corp|private)$/.test(h)) return true;
+
+  if (!h.includes(':')) {
+    const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (m) {
+      const p = m.slice(1).map(Number);
+      if (p.some((n) => n > 255)) return true;
+      const [a, b] = p;
+      if (a === 0 || a === 10 || a === 127) return true;          // this-host, private, loopback
+      if (a === 169 && b === 254) return true;                    // link-local / cloud metadata
+      if (a === 172 && b >= 16 && b <= 31) return true;           // private
+      if (a === 192 && b === 168) return true;                    // private
+      if (a === 100 && b >= 64 && b <= 127) return true;          // CGNAT
+      if (a === 198 && (b === 18 || b === 19)) return true;       // benchmarking
+      if (a >= 224) return true;                                  // multicast / reserved
+      return false;
+    }
+    // имя без точки — локальное имя из /etc/hosts или DNS-суффикса
+    return !h.includes('.');
+  }
+
+  // IPv6
+  if (h === '::' || h === '::1') return true;
+  if (/^f[cd][0-9a-f]{0,2}(:|$)/.test(h)) return true;            // fc00::/7 (unique local)
+  if (/^fe[89ab][0-9a-f]{0,2}(:|$)/.test(h)) return true;         // fe80::/10 (link-local)
+  if (/^ff[0-9a-f]{0,2}(:|$)/.test(h)) return true;               // multicast
+  const mapped = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mapped) {
+    const hi = parseInt(mapped[1], 16), lo = parseInt(mapped[2], 16);
+    return isPrivateHost(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  const mapped4 = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (mapped4) return isPrivateHost(mapped4[1]);
+  return false;
+}
+
+function checkWebUrl(raw) {
+  let u;
+  try { u = new URL(String(raw)); } catch { return { ok: false, error: 'некорректный url' }; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { ok: false, error: 'разрешены только http и https' };
+  }
+  if (isPrivateHost(u.hostname)) {
+    return { ok: false, error: 'запрещён доступ к локальным и приватным адресам' };
+  }
+  if (u.username || u.password) return { ok: false, error: 'url с логином/паролем не поддерживается' };
+  return { ok: true, url: u };
+}
+
+async function readLimited(res, maxBytes) {
+  if (!res.body) {
+    const text = await res.text();
+    return { text: text.slice(0, maxBytes), truncated: text.length > maxBytes };
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0, truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (size + value.length > maxBytes) {
+        chunks.push(value.subarray(0, maxBytes - size));
+        truncated = true;
+        try { await reader.cancel(); } catch {}
+        break;
+      }
+      chunks.push(value);
+      size += value.length;
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  return { text: Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8'), truncated };
+}
+
+async function fetchWeb(rawUrl, opts = {}) {
+  let current = String(rawUrl);
+  let method = opts.method || 'GET';
+  let body = opts.body;
+  const maxRedirects = opts.maxRedirects == null ? 5 : opts.maxRedirects;
+
+  const abort = new AbortController();
+  const timer = setTimeout(() => { try { abort.abort(); } catch {} }, opts.timeoutMs || 20000);
+  const fail = (error) => { clearTimeout(timer); return { ok: false, error, url: current }; };
+  try {
+    for (let i = 0; i <= maxRedirects; i++) {
+      const chk = checkWebUrl(current);
+      if (!chk.ok) return fail(chk.error);
+      let res;
+      try {
+        res = await fetch(chk.url.href, { method, headers: opts.headers, body, redirect: 'manual', signal: abort.signal });
+      } catch (e) {
+        return fail(e.name === 'AbortError' ? 'таймаут запроса' : e.message);
+      }
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const loc = res.headers.get('location');
+        try { await res.body?.cancel(); } catch {}
+        if (!loc) return fail(`редирект ${res.status} без location`);
+        let next;
+        try { next = new URL(loc, chk.url.href).href; } catch { return fail('некорректный редирект'); }
+        if (res.status === 303 || ((res.status === 301 || res.status === 302) && method !== 'GET' && method !== 'HEAD')) {
+          method = 'GET';
+          body = undefined;
+        }
+        current = next;
+        continue;
+      }
+      return { ok: true, res, url: chk.url.href, timer };
+    }
+    return fail('слишком много редиректов');
+  } catch (e) {
+    return fail(e.message);
+  }
+}
+
+function ddgResults(html, limit) {
+  const out = [];
+  const seen = new Set();
+  const re = /<a\b[^>]*\bclass="[^"]*\bresult__a\b[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+  const matches = [...String(html).matchAll(re)];
+  for (let i = 0; i < matches.length && out.length < limit; i++) {
+    const m = matches[i];
+    const tag = m[0];
+    const href = (tag.match(/\bhref="([^"]*)"/i) || tag.match(/\bhref='([^']*)'/i) || [])[1] || '';
+    const title = htmlToText(m[1]);
+    const url = unwrapDdgUrl(href);
+    if (!url || !title) continue;
+    let parsed;
+    try { parsed = new URL(url); } catch { continue; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+    // реклама и внутренние переходы DuckDuckGo
+    if (/(^|\.)duckduckgo\.com$/i.test(parsed.hostname) && /^\/(y\.js|l\/)/.test(parsed.pathname)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+
+    const blockEnd = i + 1 < matches.length ? matches[i + 1].index : String(html).length;
+    const block = String(html).slice(m.index + m[0].length, blockEnd);
+    const sm = block.match(/<a\b[^>]*\bclass="[^"]*\bresult__snippet\b[^"]*"[^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<(div|td|span)\b[^>]*\bclass="[^"]*\bresult__snippet\b[^"]*"[^>]*>([\s\S]*?)<\/\1>/i);
+    const snippet = sm ? htmlToText(sm[2] == null ? sm[1] : sm[2]) : '';
+    out.push({ title, url, snippet });
+  }
+  return out;
+}
+
+function unwrapDdgUrl(raw) {
+  let href = htmlDecode(raw).trim();
+  if (!href) return '';
+  if (href.startsWith('//')) href = 'https:' + href;
+  try {
+    const u = new URL(href, 'https://duckduckgo.com');
+    const uddg = u.searchParams.get('uddg');
+    if (uddg) return uddg;
+    return u.href;
+  } catch { return href; }
+}
+
+async function webSearch(args) {
+  const query = String(args.query || '').trim();
+  if (!query) return { ok: false, error: 'пустой поисковый запрос' };
+  const limit = Math.min(20, Math.max(1, Math.floor(Number(args.limit) || 6)));
+  const target = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+  const got = await fetchWeb(target, {
+    headers: {
+      'user-agent': WEB_UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'ru-RU,ru;q=0.9,en;q=0.8',
+      referer: 'https://html.duckduckgo.com/',
+    },
+    timeoutMs: 15000,
+  });
+  if (!got.ok) return { ok: false, query, error: got.error };
+  try {
+    if (got.res.status >= 400) {
+      return { ok: false, query, error: `DuckDuckGo вернул ${got.res.status}` };
+    }
+    const { text } = await readLimited(got.res, WEB_MAX_BYTES);
+    const results = ddgResults(text, limit);
+    if (!results.length) {
+      return { ok: true, query, results: [], note: 'DuckDuckGo не вернул результатов (возможно, запрос заблокирован сетью или капчей)' };
+    }
+    return { ok: true, query, results };
+  } catch (e) {
+    return { ok: false, query, error: e.name === 'AbortError' ? 'таймаут запроса' : e.message };
+  } finally {
+    clearTimeout(got.timer);
+  }
+}
+
+async function webFetch(args) {
+  const rawUrl = String(args.url || '').trim();
+  if (!rawUrl) return { ok: false, error: 'укажите url страницы' };
+  const chk = checkWebUrl(rawUrl);
+  if (!chk.ok) return { ok: false, url: rawUrl, error: chk.error };
+
+  const got = await fetchWeb(chk.url.href, {
+    headers: {
+      'user-agent': WEB_UA,
+      accept: 'text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.5',
+      'accept-language': 'ru-RU,ru;q=0.9,en;q=0.8',
+    },
+    timeoutMs: 20000,
+  });
+  if (!got.ok) return { ok: false, url: rawUrl, error: got.error };
+
+  try {
+    if (got.res.status >= 400) {
+      return { ok: false, url: got.url, status: got.res.status, error: `HTTP ${got.res.status}` };
+    }
+    const { text, truncated: downloadTruncated } = await readLimited(got.res, WEB_MAX_BYTES);
+    const ct = String(got.res.headers.get('content-type') || '').toLowerCase();
+    const isJson = ct.includes('application/json') || ct.includes('+json');
+    let content;
+    if (isJson) content = text.trim();
+    else if (ct.includes('html') || ct.includes('xml') || /^\s*</.test(text)) content = htmlToText(text);
+    else content = text.replace(/\r\n?/g, '\n').trim();
+
+    const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
+    const max = Math.min(WEB_PAGE_CHARS, Math.max(1024, Math.floor(Number(args.length) || WEB_PAGE_CHARS)));
+    const rest = offset > 0 ? content.slice(offset) : content;
+    const truncated = rest.length > max;
+    const body = truncated
+      ? rest.slice(0, max) + `\n… [показано ${max} из ${rest.length} символов; дальше читайте с offset=${offset + max}]`
+      : rest;
+    return {
+      ok: true,
+      url: got.url,
+      total: content.length,
+      offset,
+      content: body,
+      truncated,
+      ...(downloadTruncated ? { note: 'страница больше 2 МБ — скачано только начало' } : {}),
+    };
+  } catch (e) {
+    return { ok: false, url: got.url, error: e.name === 'AbortError' ? 'таймаут запроса' : e.message };
+  } finally {
+    clearTimeout(got.timer);
+  }
+}
+
 /* ---------- вложения: чанковая загрузка любых размеров ---------- */
 const uploads = new Map(); // id -> { fp, name, size, written }
 
@@ -274,6 +567,8 @@ const TOOLS = {
   list_dir: listDir,
   read_file: readFileTool,
   write_file: writeFileTool,
+  web_search: webSearch,
+  web_fetch: webFetch,
 };
 
 async function handleToolExec(req, res) {

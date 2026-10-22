@@ -118,16 +118,51 @@ const TOOLS_SCHEMA = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Искать в интернете актуальную информацию: новости, документацию, версии, цены. Возвращает заголовки, ссылки и короткие сниппеты.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'поисковый запрос' },
+          limit: { type: 'number', description: 'сколько результатов вернуть (по умолчанию 6)' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description: 'Открыть страницу из результатов поиска и прочитать её как чистый текст. Большие страницы читайте кусками: offset (смещение в символах) + length.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'адрес страницы (http/https)' },
+          offset: { type: 'number', description: 'смещение в символах (для чтения больших страниц кусками)' },
+          length: { type: 'number', description: 'сколько символов читать за раз (по умолчанию 48К)' },
+        },
+        required: ['url'],
+      },
+    },
+  },
 ];
 
-const TOOL_LABELS = { run_terminal: 'Терминал', read_file: 'Читаю файл', write_file: 'Пишу файл', list_dir: 'Список файлов' };
+const TOOL_LABELS = {
+  run_terminal: 'Терминал', read_file: 'Читаю файл', write_file: 'Пишу файл', list_dir: 'Список файлов',
+  web_search: 'Поиск в интернете', web_fetch: 'Читаю страницу',
+};
 
 function agentSystem() {
   if (!settings.agent?.enabled || !WS.workspace) return '';
   return [
     'Ты — zx, агент-помощник по программированию, работающий на машине пользователя.',
     `Рабочая папка: ${WS.workspace} (платформа: ${WS.platform}).`,
-    'Доступные инструменты: run_terminal (команды терминала), read_file, write_file, list_dir.',
+    'Доступные инструменты: run_terminal (команды терминала), read_file, write_file, list_dir, web_search, web_fetch.',
+    'Есть инструменты web_search и web_fetch: если данных не хватает или они могут устареть — сначала web_search, затем web_fetch 1–3 самых подходящих страниц, опирайся на источники и указывай их ссылки в ответе.',
     'Перед правками сначала смотри реальные файлы (read_file/list_dir), не выдумывай их содержимое.',
     'После изменений запускай проверки (тесты/сборку) через run_terminal и разбирай ошибки.',
     'Каждое действие пользователь подтверждает вручную. Отвечай кратко, по делу, на русском.',
@@ -248,12 +283,23 @@ function toolCardHtml(st) {
   } else if (st.tool === 'write_file') {
     short = st.args.path + ` (${(st.args.content || '').length} симв.)`;
     detail = (st.args.content || '').split('\n').slice(0, 12).join('\n');
+  } else if (st.tool === 'web_search') {
+    const results = Array.isArray(st.result?.results) ? st.result.results : [];
+    short = `«${st.args.query || ''}»` + (st.result?.ok ? ` → ${results.length} рез.` : '');
+    detail = results.length
+      ? results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet || ''}`.trim()).join('\n\n')
+      : String(st.result?.error || st.result?.note || '');
+  } else if (st.tool === 'web_fetch') {
+    short = st.args.url || '';
+    detail = String(st.result?.content || st.result?.error || '');
   } else {
     short = st.args.path || '.';
     detail = st.tool === 'read_file' ? String(st.result?.content || '').split('\n').slice(0, 12).join('\n')
       : (st.result?.entries || []).join('  ');
   }
-  const status = st.pending ? '⏳' : (st.denied ? '✕ отклонено' : (st.ok ? '✓' : '✗ код ' + (st.result?.exitCode ?? '?')));
+  const status = st.pending ? '⏳'
+    : (st.denied ? '✕ отклонено'
+      : (st.ok ? '✓' : '✗' + (st.result?.exitCode != null ? ' код ' + st.result.exitCode : '')));
   return `<div class="tool-card ${st.ok === false && !st.pending && !st.denied ? 'tool-err' : ''}">` +
     `<div class="tool-head"><span class="tool-ico">⚙</span><b>${esc(label)}</b>` +
     `<span class="tool-args">${esc(short.length > 110 ? short.slice(0, 110) + '…' : short)}</span>` +
@@ -561,6 +607,8 @@ function approvalDetail(call) {
     const lines = String(call.args.content || '').split('\n');
     return `${call.args.path} — записать ${lines.length} строк:\n\n` + lines.slice(0, 30).join('\n') + (lines.length > 30 ? '\n…' : '');
   }
+  if (call.name === 'web_search') return `Поиск в интернете: ${call.args.query || ''}\n# ${call.args.limit || 6} результатов`;
+  if (call.name === 'web_fetch') return `Открыть страницу:\n${call.args.url || ''}`;
   return call.args.path || '(рабочая папка)';
 }
 
@@ -982,10 +1030,13 @@ async function runCompletion(c) {
             const { denied, result } = await execTool({ ...call, args, provider: target.provider.name });
             st.pending = false; st.denied = denied; st.result = result; st.ok = !!result.ok;
             rerender();
+            // web_fetch отдаёт до 48К символов страницы — модели нужен весь кусок,
+            // чтобы работал offset-хинт в конце; остальные результаты короче.
+            const toolBudget = call.name === 'web_fetch' ? 50 * 1024 : 8000;
             apiMessages.push({
               role: 'tool',
               tool_call_id: id,
-              content: JSON.stringify(result).slice(0, 8000),
+              content: JSON.stringify(result).slice(0, toolBudget),
             });
           }
           continue; // следующий заход: модель видит результаты

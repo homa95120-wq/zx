@@ -45,8 +45,8 @@ jobs:
       - name: Publish to Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: zx-agent-v1.3.0
-          name: zx-agent v1.3.0 — Windows .exe — Windows .exe
+          tag_name: zx-agent-v1.4.0
+          name: zx-agent v1.4.0 — Windows .exe
           files: release/zx-agent.exe
           body: |
             zx — ИИ-агент для кода в одном файле.
