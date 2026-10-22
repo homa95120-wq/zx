@@ -11,11 +11,13 @@ const { JSDOM } = require('jsdom');
 const PORT = 3312;
 const BASE = `http://127.0.0.1:${PORT}`;
 const WS_DIR = path.join(os.tmpdir(), 'zx-ws-smoke');
+const WS_DIR2 = path.join(os.tmpdir(), 'zx-ws-smoke-2');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   fs.rmSync(WS_DIR, { recursive: true, force: true });
+  fs.rmSync(WS_DIR2, { recursive: true, force: true });
   fs.mkdirSync(WS_DIR, { recursive: true });
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
@@ -128,6 +130,23 @@ async function main() {
     body: JSON.stringify({ tool: 'write_file', args: { path: 'smoke.txt', content: 'ok' } }),
   });
   check('сервер исполняет write_file в workspace', execRes.ok && fs.existsSync(path.join(WS_DIR, 'smoke.txt')));
+
+  // смена рабочей папки через UI
+  doc.querySelector('#wsBtn').click();
+  await sleep(100);
+  const wsModal = doc.querySelector('#wsModal');
+  check('модалка папки открылась', wsModal && !wsModal.hidden);
+  const wsInput = doc.querySelector('#wsPath');
+  wsInput.value = WS_DIR2;
+  doc.querySelector('#wsCreate').checked = true;
+  doc.querySelector('#wsApplyBtn').click();
+  await sleep(1200);
+
+  check('модалка папки закрылась после выбора', wsModal.hidden);
+  check('подсказка показывает новую папку', (doc.querySelector('#composerHint')?.textContent || '').includes('zx-ws-smoke-2'), doc.querySelector('#composerHint')?.textContent);
+  check('контекст-файл создан в новой папке', fs.existsSync(path.join(WS_DIR2, 'zx-context.json')), 'zx-context.json');
+  const savedCtx = JSON.parse(fs.readFileSync(path.join(WS_DIR2, 'zx-context.json'), 'utf8'));
+  check('в контексте есть чат', Array.isArray(savedCtx.chats) && savedCtx.chats.some((c) => (c.title || '').includes('Выполни echo')));
 
   // настройки
   doc.querySelector('#openSettingsBtn').click();

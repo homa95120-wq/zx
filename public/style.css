@@ -484,3 +484,17 @@ details.think .think-body { padding: 2px 14px 10px; white-space: pre-wrap; line-
 .key-free.paid, .tag.paid {
   color: var(--warn); background: #F7EEDD;
 }
+
+/* ---------- Выбор папки ---------- */
+.ws-current { font-size: 12.5px; color: var(--text-2); margin-bottom: 8px; word-break: break-all; }
+.ws-current code { background: #EFEDE3; border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: #3E3C35; }
+.ws-input {
+  width: 100%;
+  border: 1px solid var(--border-strong); border-radius: 10px;
+  padding: 11px 13px; font-size: 13.5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  background: #fff; outline: none; margin-bottom: 10px;
+}
+.ws-input:focus { border-color: var(--accent); }
+.composer-hint { cursor: pointer; }
+.composer-hint:hover { color: var(--text-2); }

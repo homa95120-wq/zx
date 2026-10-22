@@ -126,7 +126,20 @@ async function handleProxy(req, res) {
 }
 
 /* ---------------- агент: выполнение инструментов на машине ---------------- */
-const WORKSPACE = path.resolve(process.env.ZX_WORKSPACE || process.cwd());
+// Рабочую папку можно сменить на лету (POST /api/agent/workspace) — выбор
+// сохраняется в конфиг рядом с местом запуска (важно для zx-agent.exe).
+const CONFIG_FILE = path.resolve(process.env.ZX_CONFIG || path.join(process.cwd(), 'zx.config.json'));
+let WORKSPACE = path.resolve(process.env.ZX_WORKSPACE || process.cwd());
+(function loadConfig() {
+  try {
+    if (process.env.ZX_WORKSPACE) return; // env имеет приоритет (тесты/скрипты)
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    if (cfg.workspace) WORKSPACE = path.resolve(cfg.workspace);
+  } catch {}
+})();
+function saveConfig() {
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify({ workspace: WORKSPACE }, null, 2)); } catch {}
+}
 const MAX_OUT = 16 * 1024;          // обрезать вывод команды до 16 КБ
 const CMD_TIMEOUT = 120 * 1000;     // таймаут команды — 2 минуты
 
@@ -266,7 +279,55 @@ const server = http.createServer(async (req, res) => {
         platform: process.platform,
         node: process.version,
         exe: !!process.pkg,
+        contextFile: path.join(WORKSPACE, 'zx-context.json'),
+        configFile: CONFIG_FILE,
       });
+    }
+
+    if (u.pathname === '/api/agent/workspace' && req.method === 'POST') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'bad json' }); }
+      const raw = String(body.path || '').trim();
+      if (!raw) return send(res, 400, { error: 'укажите путь к папке' });
+      const target = path.resolve(raw);
+      let st = null;
+      try { st = await fs.promises.stat(target); } catch {}
+      if (st && !st.isDirectory()) return send(res, 400, { error: 'это не папка, а файл' });
+      if (!st) {
+        if (!body.create) return send(res, 400, { error: 'папка не существует', needCreate: true });
+        try {
+          await fs.promises.mkdir(target, { recursive: true });
+        } catch (e) { return send(res, 400, { error: 'не удалось создать папку: ' + e.message }); }
+      }
+      WORKSPACE = target;
+      saveConfig();
+      return send(res, 200, { ok: true, workspace: WORKSPACE });
+    }
+
+    // контекст (чаты+настройки) живёт в файле внутри рабочей папки
+    if (u.pathname === '/api/store/chats' && req.method === 'GET') {
+      const file = path.join(WORKSPACE, 'zx-context.json');
+      try {
+        const data = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+        return send(res, 200, { exists: true, data });
+      } catch { return send(res, 200, { exists: false }); }
+    }
+
+    if (u.pathname === '/api/store/chats' && req.method === 'PUT') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'bad json' }); }
+      const file = path.join(WORKSPACE, 'zx-context.json');
+      const payload = {
+        savedAt: new Date().toISOString(),
+        workspace: WORKSPACE,
+        curId: body.curId || null,
+        chats: Array.isArray(body.chats) ? body.chats.slice(0, 60) : [],
+        settings: body.settings && typeof body.settings === 'object' ? body.settings : {},
+      };
+      try {
+        await fs.promises.writeFile(file, JSON.stringify(payload, null, 2));
+      } catch (e) { return send(res, 500, { error: e.message }); }
+      return send(res, 200, { ok: true, file });
     }
 
     if (u.pathname === '/api/tools/exec' && req.method === 'POST') {

@@ -123,7 +123,43 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 
-function persistChats() { save(LS.chats, { chats: chats.slice(0, 60), curId }); }
+function persistChats() {
+  save(LS.chats, { chats: chats.slice(0, 60), curId });
+  saveContext();
+}
+
+/* Контекст (чаты + настройки) дублируется в файл zx-context.json
+   внутри рабочей папки агента — «вся работа хранится в выбранной папке». */
+let ctxSaving = false, ctxDirty = false;
+function saveContext() {
+  if (!WS.workspace) return;
+  if (ctxSaving) { ctxDirty = true; return; }
+  ctxSaving = true;
+  fetch('/api/store/chats', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      chats: chats.slice(0, 60),
+      curId,
+      settings: { model: settings.model, system: settings.system, agent: settings.agent },
+    }),
+  }).catch(() => {}).finally(() => {
+    ctxSaving = false;
+    if (ctxDirty) { ctxDirty = false; saveContext(); }
+  });
+}
+
+function applyServerContext(data) {
+  if (!data || !Array.isArray(data.chats)) return false;
+  chats = data.chats;
+  curId = data.curId && chats.find((c) => c.id === data.curId) ? data.curId : (chats[0]?.id || null);
+  if (data.settings) {
+    if (data.settings.model !== undefined) settings.model = data.settings.model;
+    if (typeof data.settings.system === 'string') settings.system = data.settings.system;
+    if (data.settings.agent) settings.agent = Object.assign({}, settings.agent, data.settings.agent);
+  }
+  return true;
+}
 const curChat = () => chats.find((c) => c.id === curId) || null;
 
 let toastTimer = null;
@@ -355,8 +391,9 @@ function renderAgentChip() {
   const hint = $('#composerHint');
   if (hint) {
     hint.textContent = on && WS.workspace
-      ? `агент: ${WS.platform === 'win32' ? 'Windows' : WS.platform} · ${WS.workspace}`
+      ? `папка агента: ${WS.workspace} — сменить`
       : (on ? 'агент: терминал и файлы' : '');
+    hint.title = 'Сменить рабочую папку агента';
   }
 }
 
@@ -1038,7 +1075,63 @@ $('#saveSettingsBtn').addEventListener('click', () => {
   modelsCache = {}; save(LS.models, {});
   closeSettings();
   renderAll();
+  saveContext();
   toast('Сохранено — провайдеры обновлены');
+});
+
+/* ---------------- выбор рабочей папки ---------------- */
+function openWsModal() {
+  $('#wsCurrent').textContent = WS.workspace || '—';
+  $('#wsPath').value = WS.workspace || '';
+  $('#wsCreate').checked = false;
+  $('#wsModal').hidden = false;
+  $('#wsPath').focus();
+}
+function closeWsModal() { $('#wsModal').hidden = true; }
+
+async function reloadContextFromWorkspace() {
+  let loaded = false;
+  try {
+    const j = await (await fetch('/api/store/chats')).json();
+    if (j.exists) loaded = applyServerContext(j.data);
+  } catch {}
+  if (!loaded) {
+    // в новой папке контекста нет — переносим текущие чаты с собой
+    saveContext();
+  }
+  renderAll();
+}
+
+$('#wsBtn').addEventListener('click', () => { openWsModal(); closeSidebar(); });
+$('#wsCloseBtn').addEventListener('click', closeWsModal);
+$('#wsModal').addEventListener('click', (e) => { if (e.target === $('#wsModal')) closeWsModal(); });
+$('#composerHint').addEventListener('click', openWsModal);
+$('#wsApplyBtn').addEventListener('click', async () => {
+  const path = $('#wsPath').value.trim();
+  if (!path) return;
+  $('#wsApplyBtn').disabled = true;
+  try {
+    const res = await fetch('/api/agent/workspace', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path, create: $('#wsCreate').checked }),
+    });
+    const j = await res.json();
+    if (!res.ok || !j.ok) {
+      if (j.needCreate && !$('#wsCreate').checked) toast('Папки нет — отметьте «создать папку» и повторите', true);
+      else toast(j.error || 'Не удалось сменить папку', true);
+      return;
+    }
+    WS.workspace = j.workspace;
+    $('#wsModal').hidden = true;
+    renderAgentChip();
+    await reloadContextFromWorkspace();
+    toast(`Папка агента: ${j.workspace}`);
+  } catch (e) {
+    toast('Ошибка: ' + e.message, true);
+  } finally {
+    $('#wsApplyBtn').disabled = false;
+  }
 });
 
 /* ---------------- сайдбар (мобильный) ---------------- */
@@ -1066,7 +1159,7 @@ async function boot() {
   const saved = load(LS.chats, { chats: [], curId: null });
   chats = Array.isArray(saved?.chats) ? saved.chats : [];
   curId = saved?.curId || null;
-  keys = load(LS.keys, {}) || {};
+  keys = load(LS.keys, {}) || {}; // ключи — только в браузере, в папку не пишем
   settings = Object.assign({ model: 'auto', system: '', custom: {}, agent: {} }, load(LS.settings, {}));
   settings.custom = Object.assign({ url: '', key: '', model: '' }, settings.custom || {});
   settings.agent = Object.assign({ enabled: true, ask: true }, settings.agent || {});
@@ -1079,6 +1172,14 @@ async function boot() {
   } catch {
     toast('Не удалось связаться с сервером zx', true);
   }
+
+  // контекст из рабочей папки важнее localStorage
+  try {
+    const j = await (await fetch('/api/store/chats')).json();
+    if (j.exists) {
+      if (applyServerContext(j.data)) save(LS.settings, settings);
+    }
+  } catch {}
 
   if (!chats.find((c) => c.id === curId)) curId = chats[0]?.id || null;
   if (!chats.length) { const c = { id: uid(), title: 'Новый чат', createdAt: Date.now(), messages: [] }; chats.unshift(c); curId = c.id; }

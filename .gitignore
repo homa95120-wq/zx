@@ -4,3 +4,4 @@ node_modules/
 *.log
 nohup.out
 .DS_Store
+zx.config.json

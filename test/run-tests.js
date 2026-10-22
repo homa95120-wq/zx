@@ -29,7 +29,7 @@ async function main() {
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: WS_DIR },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: WS_DIR, ZX_CONFIG: path.join(os.tmpdir(), 'zx-test-config.json') },
   });
   await new Promise((r) => setTimeout(r, 700));
 
@@ -103,6 +103,35 @@ async function main() {
 
   const info = await req('GET', '/api/agent/info');
   check('agent/info: workspace', JSON.parse(info.body).workspace === WS_DIR, JSON.parse(info.body).workspace);
+
+
+  // 4c. выбор рабочей папки и хранение контекста
+  const WS2 = path.join(WS_DIR, 'deep', 'nested');
+  const cfgFile = path.join(os.tmpdir(), 'zx-test-config.json');
+  fs.rmSync(cfgFile, { force: true });
+
+  const noDir = await req('POST', '/api/agent/workspace', JSON.stringify({ path: WS2 }), { 'content-type': 'application/json' });
+  check('смена папки: без create — отказ', noDir.status === 400 && JSON.parse(noDir.body).needCreate === true);
+
+  const wsSet = await req('POST', '/api/agent/workspace', JSON.stringify({ path: WS2, create: true }), { 'content-type': 'application/json' });
+  check('смена папки: с create — ок', wsSet.status === 200 && JSON.parse(wsSet.body).workspace === WS2);
+
+  const info2 = JSON.parse((await req('GET', '/api/agent/info')).body);
+  check('agent/info: новая папка', info2.workspace === WS2);
+  check('конфиг сохранён', fs.existsSync(cfgFile) && JSON.parse(fs.readFileSync(cfgFile, 'utf8')).workspace === WS2, cfgFile);
+
+  const w2 = await exec({ tool: 'write_file', args: { path: 'in-new-ws.txt', content: 'here' } });
+  check('инструменты пишут в новую папку', JSON.parse(w2.body).ok === true && fs.existsSync(path.join(WS2, 'in-new-ws.txt')));
+
+  const putCtx = await req('PUT', '/api/store/chats', JSON.stringify({ curId: 'x', chats: [{ id: 'x', title: 'Т', messages: [] }], settings: { system: 'тест' } }), { 'content-type': 'application/json' });
+  const ctxPath = path.join(WS2, 'zx-context.json');
+  check('контекст сохранён в папку', putCtx.status === 200 && fs.existsSync(ctxPath));
+
+  const getCtx = JSON.parse((await req('GET', '/api/store/chats')).body);
+  check('контекст читается обратно', getCtx.exists === true && getCtx.data.chats[0].id === 'x' && getCtx.data.settings.system === 'тест');
+
+  // вернём исходную папку
+  await req('POST', '/api/agent/workspace', JSON.stringify({ path: WS_DIR }), { 'content-type': 'application/json' });
 
   // 5. защита от левых url
   const evil = await req('POST', '/api/proxy', JSON.stringify({ url: 'ftp://evil', payload: {} }), { 'content-type': 'application/json' });
