@@ -49,6 +49,13 @@ async function main() {
   let chatCalls = 0;
   let lastChatBody = '';
   let force429 = false;
+  // сценарий веб-инструментов: поиск → чтение страницы → финальный ответ (моки)
+  let webScenario = false;
+  let webPhase = 0;
+  const webSources = [
+    { title: 'Погода в Амстердаме сегодня', url: 'https://example.com/weather', snippet: 'Сейчас +12 °C, облачно, ветер 5 м/с.' },
+    { title: 'Amsterdam weather forecast', url: 'https://example.org/ams', snippet: 'Прогноз на неделю и карта осадков.' },
+  ];
 
   const dom = await JSDOM.fromFile(path.join(__dirname, '..', 'public', 'index.html'), {
     url: BASE + '/',
@@ -64,6 +71,20 @@ async function main() {
         if (url.startsWith('/api/proxy') && typeof init?.body === 'string' && init.body.includes('ovh')) {
           return Promise.resolve(new Response(JSON.stringify({ error: 'upstream blocked in test' }), { status: 502, headers: { 'content-type': 'application/json' } }));
         }
+        // инструменты поиска/чтения замоканы: в песочнице нет внешней сети
+        if (url.startsWith('/api/tools/exec') && typeof init?.body === 'string') {
+          let toolBody = null;
+          try { toolBody = JSON.parse(init.body); } catch {}
+          if (toolBody?.tool === 'web_search') {
+            return Promise.resolve(jsonResp({ ok: true, query: toolBody.args.query, results: webSources }));
+          }
+          if (toolBody?.tool === 'web_fetch') {
+            return Promise.resolve(jsonResp({
+              ok: true, url: toolBody.args.url, total: 67, offset: 0, truncated: false,
+              content: 'Погода в Амстердаме: +12 °C, облачно. Ветер 5 м/с. Подробный прогноз на неделю.',
+            }));
+          }
+        }
         if (url.startsWith('/')) return realFetch(BASE + url, init);
         if (url.includes('api.groq.com')) {
           if (url.endsWith('/models')) {
@@ -73,6 +94,15 @@ async function main() {
           if (typeof init?.body === 'string') lastChatBody = init.body;
           if (force429) {
             return Promise.resolve(new Response(JSON.stringify({ error: { message: 'rate limit: daily quota exceeded, try tomorrow' } }), { status: 429, headers: { 'content-type': 'application/json' } }));
+          }
+          if (webScenario) {
+            webPhase++;
+            const toolCall = (name, args) => sse([
+              { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_' + name, function: { name, arguments: JSON.stringify(args) } }] } }] },
+            ]);
+            if (webPhase === 1) return Promise.resolve(toolCall('web_search', { query: 'погода в Амстердаме', limit: 3 }));
+            if (webPhase === 2) return Promise.resolve(toolCall('web_fetch', { url: 'https://example.com/weather' }));
+            return Promise.resolve(sse([{ choices: [{ delta: { content: 'По данным поиска, в Амстердаме сейчас +12 °C, облачно. Источник: https://example.com/weather' } }] }]));
           }
           if (chatCalls === 1) {
             // первый заход: модель вызывает инструмент
@@ -156,7 +186,41 @@ async function main() {
   check('чип вложения в сообщении', [...doc.querySelectorAll('.msg-user .attach-chip')].some((e) => e.textContent.includes('note.txt')));
   check('мелкий текст авто-вшит в контекст модели', lastChatBody.includes('Файл: note.txt') && lastChatBody.includes('строка-2'));
 
+  // ---- веб-инструменты: поиск → чтение страницы (мок выдачи) ----
+  webScenario = true;
+  webPhase = 0;
+  input.value = 'Найди в интернете погоду в Амстердаме и открой лучшую страницу';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  doc.querySelector('#sendBtn').click();
+  await sleep(800);
+
+  check('веб: инструменты и промпт ушли в модель',
+    lastChatBody.includes('"web_search"') && lastChatBody.includes('"web_fetch"') && lastChatBody.includes('web_search и web_fetch'));
+  check('веб: модалка подтверждения для web_search', !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('погода в Амстердаме'), doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(1000);
+
+  check('веб: модалка подтверждения для web_fetch', !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('https://example.com/weather'), doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(1800);
+
+  const webCards = [...doc.querySelectorAll('.tool-card')].map((e) => e.textContent).join(' | ');
+  check('веб: карточка поиска — запрос и число результатов',
+    webCards.includes('Поиск в интернете') && webCards.includes('погода в Амстердаме') && webCards.includes('2 рез.'), webCards.slice(-400));
+  check('веб: карточка web_fetch — URL',
+    webCards.includes('Читаю страницу') && webCards.includes('https://example.com/weather'), webCards.slice(-300));
+  check('веб: «подробнее» показывает сниппеты',
+    webCards.includes('Погода в Амстердаме сегодня') && webCards.includes('Сейчас +12 °C'), webCards.slice(-400));
+  check('веб: «подробнее» показывает текст страницы', webCards.includes('Ветер 5 м/с'), webCards.slice(-300));
+
+  const webAnswer = [...doc.querySelectorAll('.msg-assistant .content')].map((e) => e.textContent).join('|');
+  check('веб: финальный ответ со ссылкой на источник',
+    webAnswer.includes('+12 °C') && webAnswer.includes('https://example.com/weather'), webAnswer.slice(-200));
+
   // ---- дневной лимит: запоминается и провайдер обходится ----
+  webScenario = false;
   force429 = true;
   input.value = 'Ещё один вопрос';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));

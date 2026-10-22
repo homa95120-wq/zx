@@ -101,6 +101,35 @@ async function main() {
   const unk = await exec({ tool: 'hack', args: {} });
   check('неизвестный инструмент отклонён', unk.status === 400);
 
+  // 4b-2. веб-инструменты: SSRF-защита и схемы (без реального интернета).
+  // Поиск и чтение публичных страниц проверяются на машине пользователя.
+  const webFetchAs = async (url) => JSON.parse((await exec({ tool: 'web_fetch', args: { url } })).body);
+  const privateUrls = [
+    `http://127.0.0.1:${PORT}/`,
+    `http://localhost:${PORT}/`,
+    'http://10.0.0.5/',
+    'http://172.16.0.1/',
+    'http://192.168.1.1/',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://[::1]:3000/',
+    'http://metadata.google.internal/computeMetadata/v1/',
+    'http://example.com@127.0.0.1/',
+  ];
+  for (const url of privateUrls) {
+    const r = await webFetchAs(url);
+    check(`web_fetch: SSRF — ${url}`, r.ok === false && /приват|локальн|запрещ/i.test(r.error || ''), r.error);
+  }
+  const wfFile = await webFetchAs('file:///etc/passwd');
+  check('web_fetch: file:// отклонён', wfFile.ok === false && /http/i.test(wfFile.error || ''), wfFile.error);
+  const wfFtp = await webFetchAs('ftp://example.com/file');
+  check('web_fetch: ftp:// отклонён', wfFtp.ok === false && /http/i.test(wfFtp.error || ''), wfFtp.error);
+  const wfNoUrl = JSON.parse((await exec({ tool: 'web_fetch', args: {} })).body);
+  check('web_fetch: без url — ошибка', wfNoUrl.ok === false && !!wfNoUrl.error, wfNoUrl.error);
+  const wsNoQuery = JSON.parse((await exec({ tool: 'web_search', args: {} })).body);
+  check('web_search: без query — ошибка', wsNoQuery.ok === false && !!wsNoQuery.error, wsNoQuery.error);
+  const unkWeb = await exec({ tool: 'web_hack', args: {} });
+  check('неизвестный веб-инструмент отклонён', unkWeb.status === 400);
+
   const info = await req('GET', '/api/agent/info');
   check('agent/info: workspace', JSON.parse(info.body).workspace === WS_DIR, JSON.parse(info.body).workspace);
 
