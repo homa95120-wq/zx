@@ -55,6 +55,7 @@ async function main() {
 
   let chatCalls = 0;
   let lastChatBody = '';
+  let lastCerebrasBody = '';
   let force429 = false;
   // сценарий веб-инструментов: поиск → чтение страницы → финальный ответ (моки)
   let webScenario = false;
@@ -62,6 +63,10 @@ async function main() {
   // сценарий видеомонтажа: media_probe → media_render (ошибка) → media_render (успех) → media_probe → финальный ответ
   let videoScenario = false;
   let videoPhase = 0;
+  // сценарий: 2 ПАРАЛЛЕЛЬНЫХ tool_calls в одном ответе (один — без index) +
+  // на следующем шаге 503 ДО начала потока (ретрай + фейловер на Cerebras)
+  let multiScenario = false;
+  let multiGroqCalls = 0;
   const webSources = [
     { title: 'Погода в Амстердаме сегодня', url: 'https://example.com/weather', snippet: 'Сейчас +12 °C, облачно, ветер 5 м/с.' },
     { title: 'Amsterdam weather forecast', url: 'https://example.org/ams', snippet: 'Прогноз на неделю и карта осадков.' },
@@ -75,7 +80,7 @@ async function main() {
     beforeParse(window) {
       window.TextDecoder = TextDecoder;
       window.TextEncoder = TextEncoder;
-      window.localStorage.setItem('zx.keys', JSON.stringify({ groq: 'test-key' }));
+      window.localStorage.setItem('zx.keys', JSON.stringify({ groq: 'test-key', cerebras: 'test-key' }));
       window.fetch = (input, init) => {
         const url = String(input instanceof Object ? input.url : input);
         if (url.startsWith('/api/proxy') && typeof init?.body === 'string' && init.body.includes('ovh')) {
@@ -162,6 +167,20 @@ async function main() {
           if (force429) {
             return Promise.resolve(new Response(JSON.stringify({ error: { message: 'rate limit: daily quota exceeded, try tomorrow' } }), { status: 429, headers: { 'content-type': 'application/json' } }));
           }
+          if (multiScenario) {
+            multiGroqCalls++;
+            if (multiGroqCalls === 1) {
+              // 2 tool_calls в ОДНОМ ответе: list_dir (index 0) + run_terminal
+              // (БЕЗ index, аргументы по чанкам — стиль OVH/vLLM/Qwen3)
+              return Promise.resolve(sse([
+                { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_m1', function: { name: 'list_dir', arguments: '{}' } }] } }] },
+                { choices: [{ delta: { tool_calls: [{ id: 'call_m2', function: { name: 'run_terminal', arguments: '{"comm' } }] } }] },
+                { choices: [{ delta: { tool_calls: [{ function: { arguments: 'and": "echo multi-tool-ok"}' } }] } }] },
+              ]));
+            }
+            // следующий шаг: 503 ДО начала потока (оригинал + ретрай) → фейловер
+            return Promise.resolve(new Response(JSON.stringify({ error: { message: 'upstream overloaded (mock 503)' } }), { status: 503, headers: { 'content-type': 'application/json' } }));
+          }
           if (videoScenario) {
             videoPhase++;
             const toolCall = (name, args) => sse([
@@ -201,6 +220,17 @@ async function main() {
           }
           // второй заход: финальный текст
           return Promise.resolve(sse([{ choices: [{ delta: { content: 'Готово: команда вывела agent-ok.' } }] }]));
+        }
+        if (url.includes('api.cerebras.ai')) {
+          if (url.endsWith('/models')) {
+            return Promise.resolve(jsonResp({ data: [{ id: 'mock-cerebras-70b' }] }));
+          }
+          if (multiScenario) {
+            if (typeof init?.body === 'string') lastCerebrasBody = init.body;
+            // следующий провайдер в цепочке: дописывает финальный ответ
+            return Promise.resolve(sse([{ choices: [{ delta: { content: 'Готово: оба инструмента выполнены, echo вывел multi-tool-ok.' } }] }]));
+          }
+          return Promise.resolve(new Response(JSON.stringify({ error: { message: 'mock busy (сценарий не активен)' } }), { status: 503, headers: { 'content-type': 'application/json' } }));
         }
         return Promise.resolve(new Response('{}', { status: 403 }));
       };
@@ -375,8 +405,58 @@ async function main() {
     videoAnswer.includes(path.join(WS_DIR, 'out.mp4')) && videoAnswer.includes('1280x720'),
     videoAnswer.slice(-220));
 
+  // ---- параллельные tool_calls + 503 до потока → ретрай + фейловер ----
+  videoScenario = false;
+  multiScenario = true;
+  multiGroqCalls = 0;
+  input.value = 'Посмотри список файлов и выполни echo multi-tool-ok';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  doc.querySelector('#sendBtn').click();
+  await sleep(700);
+
+  check('multi: модалка первого инструмента (list_dir)', !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apToolName')?.textContent || '').includes('Список файлов'), doc.querySelector('#apToolName')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(500);
+
+  check('multi: модалка второго инструмента (стрим без index)', !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('echo multi-tool-ok'), doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  // далее: 503 до потока → ретрай ~1.5с → 503 → фейловер на Cerebras (финальный ответ)
+  await sleep(3000);
+
+  const lastMsg = [...doc.querySelectorAll('.msg-assistant')].pop();
+  const multiCards = lastMsg ? [...lastMsg.querySelectorAll('.tool-card')].map((e) => e.textContent).join(' | ') : '';
+  check('multi: 2 карточки — list_dir и терминал', multiCards.includes('Список файлов') && multiCards.includes('echo multi-tool-ok'), multiCards.slice(0, 220));
+  check('multi: обе ✓, без зависшего ⏳', (multiCards.match(/✓/g) || []).length >= 2 && !multiCards.includes('⏳'), multiCards.slice(-140));
+
+  const multiAnswer = lastMsg ? [...lastMsg.querySelectorAll('.content')].map((e) => e.textContent).join('') : '';
+  check('multi: финальный ответ после 503 (ретрай/следующий провайдер)', multiAnswer.includes('multi-tool-ok'), multiAnswer.slice(-160));
+
+  const multiBadge = lastMsg?.querySelector('.msg-badge')?.textContent || '';
+  check('multi: бейдж показывает обход провайдера', multiBadge.includes('↻'), multiBadge);
+
+  // следующий провайдер получил ПОЛНУЮ историю: assistant с 2 tool_calls + 2 результата
+  let multiBody = null;
+  try { multiBody = JSON.parse(lastChatBody); } catch {}
+  const multiAsst = (multiBody?.messages || []).find((msg) => msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length === 2);
+  check('multi: в истории assistant с 2 tool_calls', !!multiAsst, lastChatBody.slice(0, 160));
+  const multiTools = (multiBody?.messages || []).filter((msg) => msg.role === 'tool');
+  check('multi: 2 tool-результата с корректными id', multiTools.length === 2 && multiTools.map((t) => t.tool_call_id).join(',') === 'call_m1,call_m2', JSON.stringify(multiTools.map((t) => t.tool_call_id)));
+
+  // следующий провайдер (Cerebras) получил накопленную историю целиком —
+  // выполненные шаги не потерялись и не запускались повторно
+  let cereBody = null;
+  try { cereBody = JSON.parse(lastCerebrasBody); } catch {}
+  const cereAsst = (cereBody?.messages || []).find((msg) => msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length === 2);
+  const cereTools = (cereBody?.messages || []).filter((msg) => msg.role === 'tool');
+  check('multi: следующий провайдер получил накопленную историю (2 tool_calls + 2 результата)',
+    !!cereAsst && cereTools.length === 2 && cereTools.map((t) => t.tool_call_id).join(',') === 'call_m1,call_m2',
+    lastCerebrasBody.slice(0, 120));
+
   // ---- дневной лимит: запоминается и провайдер обходится ----
   videoScenario = false;
+  multiScenario = false;
   webScenario = false;
   force429 = true;
   input.value = 'Ещё один вопрос';

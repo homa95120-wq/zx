@@ -93,7 +93,12 @@ async function handleProxy(req, res) {
   }
 
   const ac = new AbortController();
-  req.on('close', () => ac.abort());
+  // надёжно ловим реальное отключение клиента (по аналогии с handleToolExec):
+  // в Node 22 обрыв стрима со стороны браузера не всегда доходит до req 'close'
+  const onAbort = () => { if (!res.writableEnded) ac.abort(); };
+  req.on('aborted', onAbort);
+  req.on('close', () => { if (!req.complete && !res.writableEnded) ac.abort(); });
+  res.on('close', onAbort);
 
   const killTimer = setTimeout(() => { try { ac.abort(); } catch {} }, 45 * 1000);
   let up;
