@@ -21,7 +21,14 @@ async function main() {
   fs.mkdirSync(WS_DIR, { recursive: true });
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ZX_NO_OPEN: '1', ZX_WORKSPACE: WS_DIR },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      HOST: '127.0.0.1',
+      ZX_NO_OPEN: '1',
+      ZX_WORKSPACE: WS_DIR,
+      ZX_CONFIG: path.join(os.tmpdir(), 'zx-smoke-config.json'),
+    },
   });
   await sleep(600);
 
@@ -52,6 +59,9 @@ async function main() {
   // сценарий веб-инструментов: поиск → чтение страницы → финальный ответ (моки)
   let webScenario = false;
   let webPhase = 0;
+  // сценарий видеомонтажа: media_probe → media_render (ошибка) → media_render (успех) → media_probe → финальный ответ
+  let videoScenario = false;
+  let videoPhase = 0;
   const webSources = [
     { title: 'Погода в Амстердаме сегодня', url: 'https://example.com/weather', snippet: 'Сейчас +12 °C, облачно, ветер 5 м/с.' },
     { title: 'Amsterdam weather forecast', url: 'https://example.org/ams', snippet: 'Прогноз на неделю и карта осадков.' },
@@ -71,7 +81,7 @@ async function main() {
         if (url.startsWith('/api/proxy') && typeof init?.body === 'string' && init.body.includes('ovh')) {
           return Promise.resolve(new Response(JSON.stringify({ error: 'upstream blocked in test' }), { status: 502, headers: { 'content-type': 'application/json' } }));
         }
-        // инструменты поиска/чтения замоканы: в песочнице нет внешней сети
+        // инструменты поиска/чтения и видео замоканы для UI-смоука
         if (url.startsWith('/api/tools/exec') && typeof init?.body === 'string') {
           let toolBody = null;
           try { toolBody = JSON.parse(init.body); } catch {}
@@ -84,6 +94,63 @@ async function main() {
               content: 'Погода в Амстердаме: +12 °C, облачно. Ветер 5 м/с. Подробный прогноз на неделю.',
             }));
           }
+          if (toolBody?.tool === 'media_probe') {
+            const p = String(toolBody.args.path || '');
+            if (p.includes('out.mp4')) {
+              return Promise.resolve(jsonResp({
+                ok: true,
+                path: path.join(WS_DIR, 'out.mp4'),
+                duration: 10,
+                sizeBytes: 1572864,
+                format: 'mov,mp4',
+                hasVideo: true,
+                hasAudio: true,
+                streams: [
+                  { type: 'video', codec: 'h264', width: 1280, height: 720, fps: 30, bitrate: 1100000, sampleRate: null, channels: null },
+                  { type: 'audio', codec: 'aac', width: null, height: null, fps: null, bitrate: 128000, sampleRate: 48000, channels: 2 },
+                ],
+              }));
+            }
+            return Promise.resolve(jsonResp({
+              ok: true,
+              path: path.join(WS_DIR, 'raw.mp4'),
+              duration: 42.5,
+              sizeBytes: 8388608,
+              format: 'mov,mp4',
+              hasVideo: true,
+              hasAudio: true,
+              streams: [
+                { type: 'video', codec: 'h264', width: 1920, height: 1080, fps: 30, bitrate: 2500000, sampleRate: null, channels: null },
+                { type: 'audio', codec: 'aac', width: null, height: null, fps: null, bitrate: 192000, sampleRate: 48000, channels: 2 },
+              ],
+              scenes: [{ time: 3.12, score: 0.45 }, { time: 14.8, score: 0.61 }],
+            }));
+          }
+          if (toolBody?.tool === 'media_render') {
+            const arr = Array.isArray(toolBody.args?.args) ? toolBody.args.args : [];
+            if (arr.includes('bad-preset')) {
+              return Promise.resolve(jsonResp({
+                ok: false,
+                exitCode: 1,
+                outPath: path.join(WS_DIR, 'out.mp4'),
+                error: 'ошибка ffmpeg (код 1): Unrecognized option bad-preset',
+                progress: { seconds: 0, fps: null, speed: null },
+                durationMs: 120,
+                timedOut: false,
+                log: 'Input #0, mov,mp4, from raw.mp4\n[error] Unrecognized option bad-preset\nError splitting the argument list',
+              }));
+            }
+            return Promise.resolve(jsonResp({
+              ok: true,
+              exitCode: 0,
+              outPath: path.join(WS_DIR, 'out.mp4'),
+              sizeBytes: 1572864,
+              progress: { seconds: 10, percent: 23.5, fps: 95, speed: '3.17x' },
+              durationMs: 3150,
+              timedOut: false,
+              log: 'Input #0, mov,mp4, from raw.mp4\nStream mapping:\n  Stream #0:0 -> #0:0 (h264 -> libx264)\nframe= 300 fps=95.0 Lsize= 1536KiB time=00:00:10.00 speed=3.17x\nmuxing overhead: 0.5%',
+            }));
+          }
         }
         if (url.startsWith('/')) return realFetch(BASE + url, init);
         if (url.includes('api.groq.com')) {
@@ -94,6 +161,27 @@ async function main() {
           if (typeof init?.body === 'string') lastChatBody = init.body;
           if (force429) {
             return Promise.resolve(new Response(JSON.stringify({ error: { message: 'rate limit: daily quota exceeded, try tomorrow' } }), { status: 429, headers: { 'content-type': 'application/json' } }));
+          }
+          if (videoScenario) {
+            videoPhase++;
+            const toolCall = (name, args) => sse([
+              { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_v_' + videoPhase, function: { name, arguments: JSON.stringify(args) } }] } }] },
+            ]);
+            if (videoPhase === 1) return Promise.resolve(toolCall('media_probe', { path: 'raw.mp4', scenes: true }));
+            if (videoPhase === 2) {
+              return Promise.resolve(toolCall('media_render', {
+                args: ['-i', 'raw.mp4', '-preset', 'bad-preset', 'out.mp4'],
+              }));
+            }
+            if (videoPhase === 3) {
+              return Promise.resolve(toolCall('media_render', {
+                args: ['-i', 'raw.mp4', '-ss', '00:00:03', '-t', '10', '-vf', 'scale=1280:720', '-c:v', 'libx264', '-c:a', 'aac', 'out.mp4'],
+              }));
+            }
+            if (videoPhase === 4) return Promise.resolve(toolCall('media_probe', { path: 'out.mp4' }));
+            return Promise.resolve(sse([{
+              choices: [{ delta: { content: `Готово! Видео смонтировано и проверено: \`${path.join(WS_DIR, 'out.mp4')}\` (10 с, 1280x720).` } }],
+            }]));
           }
           if (webScenario) {
             webPhase++;
@@ -219,7 +307,76 @@ async function main() {
   check('веб: финальный ответ со ссылкой на источник',
     webAnswer.includes('+12 °C') && webAnswer.includes('https://example.com/weather'), webAnswer.slice(-200));
 
+  // ---- видеомонтаж: media_probe → media_render (ошибка + успех) → media_probe ----
+  webScenario = false;
+  videoScenario = true;
+  videoPhase = 0;
+  input.value = 'Обрежь raw.mp4 с 3-й секунды на 10 секунд в 720p и сохрани в out.mp4';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  doc.querySelector('#sendBtn').click();
+  await sleep(700);
+
+  check('видео: схемы и системный промпт ушли в модель',
+    lastChatBody.includes('"media_probe"') && lastChatBody.includes('"media_render"') && lastChatBody.includes('Для видео используй media_probe'));
+  check('видео: подтверждение media_probe показывает путь к файлу',
+    !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apToolName')?.textContent || '').includes('Смотрю видео')
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('raw.mp4'),
+    doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(700);
+
+  // Шаг 2: неудачный media_render (проверим и подтверждение, и автораскрытие лога при ошибке)
+  check('видео: подтверждение media_render (попытка 1)',
+    !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apToolName')?.textContent || '').includes('Монтирую видео')
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('ffmpeg -i raw.mp4 -preset bad-preset out.mp4'),
+    doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(700);
+
+  // Шаг 3: успешный media_render — проверяем полную команду ffmpeg + выходной файл в модалке
+  const renderApText = doc.querySelector('#apDetail')?.textContent || '';
+  check('видео: в модалке подтверждения полная команда ffmpeg и выходной файл',
+    !doc.querySelector('#approveModal').hidden
+    && renderApText.includes('ffmpeg -i raw.mp4 -ss 00:00:03 -t 10 -vf scale=1280:720 -c:v libx264 -c:a aac out.mp4')
+    && renderApText.includes('выходной файл: out.mp4'),
+    renderApText);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(700);
+
+  // Шаг 4: контрольный media_probe по out.mp4
+  check('видео: контрольный media_probe по out.mp4',
+    !doc.querySelector('#approveModal').hidden
+    && (doc.querySelector('#apDetail')?.textContent || '').includes('out.mp4'),
+    doc.querySelector('#apDetail')?.textContent);
+  doc.querySelector('#apAllowBtn').click();
+  await sleep(1200);
+
+  const allVideoCards = [...doc.querySelectorAll('.tool-card')];
+  const videoCardsText = allVideoCards.map((e) => e.textContent).join(' | ');
+  check('видео: карточка «Смотрю видео» (длительность/разрешение/кодеки/сцены + таймкоды)',
+    videoCardsText.includes('Смотрю видео') && videoCardsText.includes('raw.mp4')
+    && videoCardsText.includes('1920x1080') && videoCardsText.includes('h264/aac')
+    && videoCardsText.includes('2 сцен') && videoCardsText.includes('3.12с'),
+    videoCardsText.slice(-500));
+  check('видео: карточка «Монтирую видео» (файл/длительность/speed/размер + лог ffmpeg)',
+    videoCardsText.includes('Монтирую видео') && videoCardsText.includes('out.mp4')
+    && videoCardsText.includes('3.17x') && videoCardsText.includes('1.5 МБ')
+    && videoCardsText.includes('muxing overhead: 0.5%'),
+    videoCardsText.slice(-500));
+  const errRenderCard = allVideoCards.find((el) => el.classList.contains('tool-err') && el.textContent.includes('Монтирую видео'));
+  check('видео: при ошибке рендера лог раскрыт автоматически (details[open])',
+    !!errRenderCard && errRenderCard.querySelector('details')?.hasAttribute('open') === true
+    && errRenderCard.textContent.includes('Unrecognized option bad-preset'));
+
+  const videoAnswer = [...doc.querySelectorAll('.msg-assistant .content')].map((e) => e.textContent).join('|');
+  check('видео: финальный ответ агента с путём к файлу',
+    videoAnswer.includes(path.join(WS_DIR, 'out.mp4')) && videoAnswer.includes('1280x720'),
+    videoAnswer.slice(-220));
+
   // ---- дневной лимит: запоминается и провайдер обходится ----
+  videoScenario = false;
   webScenario = false;
   force429 = true;
   input.value = 'Ещё один вопрос';
