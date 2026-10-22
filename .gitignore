@@ -1,0 +1,9 @@
+release/
+node_modules/
+.env
+*.log
+nohup.out
+.DS_Store
+zx.config.json
+zx-files/
+zx-context.json

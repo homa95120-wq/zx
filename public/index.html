@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>zx — ИИ-агент на бесплатных моделях</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23D97757' d='M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <div class="scrim" id="scrim"></div>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z"/></svg>
+      <span class="brand-name">zx</span>
+      <span class="brand-sub">бесплатный агент</span>
+    </div>
+
+    <button class="new-chat" id="newChatBtn">
+      <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
+      Новый чат
+    </button>
+
+    <nav class="chat-list" id="chatList"></nav>
+
+    <div class="sidebar-foot">
+      <div class="prov-status" id="provStatus"></div>
+      <button class="foot-btn" id="wsBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        Папка агента
+      </button>
+      <button class="foot-btn" id="openSettingsBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7zm7.4-3.5c0-.6.5-1.1.5-1.7 0-.6-.6-1-1.1-1.5l-1.3-.8c-.2-.6-.5-1.2-.9-1.7l.2-1.5c0-.6-.4-1.1-.9-1.4l-1.3-.4c-.5-.2-1-.4-1.6-.4l-1.2 1c-.6 0-1.2 0-1.8.2l-1.4-.7c-.5-.3-1.1-.2-1.6.1l-1 .9c-.4.4-.8.8-.9 1.4l.4 1.5c-.4.5-.7 1-.9 1.6l-1.4.7c-.5.3-.9.9-.8 1.5l.2 1.4c.1.6.4 1.1.9 1.4l1.5.5c.3.6.6 1.1 1.1 1.6l-.1 1.5c0 .6.3 1.2.8 1.5l1.2.6c.5.3 1.1.3 1.6 0l1.3-.9c.6.1 1.3.1 1.9 0l1.3.9c.5.3 1.1.3 1.6 0l1.2-.6c.5-.3.9-.9.8-1.5l-.1-1.5c.4-.5.8-1 1.1-1.6l1.5-.5c.5-.2 1-.7 1-1.3z"/></svg>
+        Настройки
+      </button>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <button class="icon-btn burger" id="burgerBtn" title="Меню">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <button class="model-pill" id="modelPill">
+        <span class="model-pill-dot" id="modelPillDot"></span>
+        <span id="modelPillLabel">Авто · лучший бесплатный</span>
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M7 10l5 5 5-5"/></svg>
+      </button>
+    </header>
+
+    <div class="thread" id="thread">
+      <div class="empty-state" id="emptyState">
+        <svg class="empty-logo" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5l1.9 6.4 5.5-3.6-3.6 5.5 6.4 1.9-6.4 1.9 3.6 5.5-5.5-3.6-1.9 6.4-1.9-6.4-5.5 3.6 3.6-5.5L1.7 11.7l6.4-1.9-3.6-5.5 5.5 3.6z"/></svg>
+        <h1 class="greeting" id="greeting">Доброе утро</h1>
+        <p class="empty-sub">Агент для кода: выполняет команды в терминале, читает и пишет файлы,<br>отвечает через бесплатные модели (Gemini, GPT-OSS, DeepSeek, Qwen) —<br>или через топовые Claude и GPT по вашему ключу.</p>
+      </div>
+      <div class="messages" id="messages"></div>
+    </div>
+
+    <div class="composer-wrap" id="composerWrap">
+      <div class="composer" id="composer">
+        <div class="attach-row" id="attachRow" hidden></div>
+        <textarea id="input" rows="1" placeholder="Спросите что угодно — или перетащите файл любого размера"></textarea>
+        <input type="file" id="fileInput" multiple hidden>
+        <div class="composer-bar">
+          <button class="icon-btn agent-btn" id="agentBtn" title="Агент: терминал и файлы">
+            <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5a4.5 4.5 0 0 0-6 6L3 18l3 3 5.5-5.5a4.5 4.5 0 0 0 6-6L15 12l-3-3 2.5-2.5z"/></svg>
+          </button>
+          <button class="icon-btn" id="plusBtn" title="Прикрепить файл любого размера">
+            <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <span class="composer-hint" id="composerHint"></span>
+          <button class="send" id="sendBtn" title="Отправить" disabled>
+            <svg class="ic-send" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>
+            <svg class="ic-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="disclaimer">Бесплатные тарифы провайдеров · лимиты запросов в день · ключи хранятся только в вашем браузере</p>
+    </div>
+
+    <div class="bottom-spacer" id="bottomSpacer"></div>
+  </main>
+</div>
+
+<div class="menu" id="modelMenu" hidden></div>
+
+<div class="modal-overlay" id="settingsModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Настройки</h2>
+      <button class="icon-btn" id="closeSettingsBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <h3>Провайдеры и ключи</h3>
+      <p class="section-sub">Бесплатные ключи — без карты. Claude и GPT — платные API вендоров по вашему ключу. Всё хранится только в этом браузере.</p>
+      <div id="keyRows"></div>
+
+      <h3>Свой endpoint (OpenAI-совместимый)</h3>
+      <p class="section-sub">Любой другой бесплатный релей — как в freellmapi: укажите URL, ключ и модель.</p>
+      <div class="custom-grid">
+        <input type="text" id="customUrl" placeholder="https://…/v1">
+        <input type="password" id="customKey" placeholder="Ключ (опционально)">
+        <input type="text" id="customModel" placeholder="Модель, напр. glm-5.3:free">
+      </div>
+
+      <h3>Инструкции для агента</h3>
+      <p class="section-sub">Системный промпт — добавляется к каждому чату.</p>
+      <textarea id="systemPrompt" rows="4" placeholder="Напр.: Отвечай кратко, по-русски, с примерами кода."></textarea>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-note">Ничего не отправляется на наш сервер — только выбранному провайдеру.</span>
+      <button class="btn-accent" id="saveSettingsBtn">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="approveModal" hidden>
+  <div class="modal approve">
+    <div class="modal-head">
+      <h2 id="apToolName">Разрешить действие?</h2>
+    </div>
+    <div class="modal-body">
+      <p class="section-sub">Агент просит выполнить действие на вашем компьютере. Проверьте его внимательно.</p>
+      <pre class="ap-detail" id="apDetail"></pre>
+      <label class="ap-remember"><input type="checkbox" id="apSession"> Больше не спрашивать в этой сессии</label>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-note">Действие выполнится локально в рабочей папке агента.</span>
+      <button class="btn-ghost" id="apDenyBtn">Отклонить</button>
+      <button class="btn-accent" id="apAllowBtn">Разрешить</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="wsModal" hidden>
+  <div class="modal approve">
+    <div class="modal-head">
+      <h2>Рабочая папка агента</h2>
+      <button class="icon-btn" id="wsCloseBtn">
+        <svg viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p class="section-sub">Здесь агент выполняет команды, читает и пишет файлы. Здесь же хранятся вся история чатов и контекст — файлом <b>zx-context.json</b>.</p>
+      <div class="ws-current">Сейчас: <code id="wsCurrent"></code></div>
+      <input type="text" id="wsPath" class="ws-input" placeholder="Напр.: C:\Users\вы\Projects или ~/projects" spellcheck="false">
+      <label class="ap-remember"><input type="checkbox" id="wsCreate"> Создать папку, если её нет</label>
+      <p class="section-sub" style="margin-top:10px">Выбор запоминается и действует при следующих запусках. Ключи моделей при смене папки не переносятся — они остаются в этом браузере.</p>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-note">Сменить папку можно в любой момент — контекст подгрузится из неё.</span>
+      <button class="btn-accent" id="wsApplyBtn">Выбрать</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
